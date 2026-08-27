@@ -32,6 +32,14 @@
 #    define POINTING_DETECT_RETRIES 3
 #endif
 
+// Boot-time expansion kill switch, implemented in yj233_split67.c. True when THIS
+// half came up with its kill key held (left = Delete, right = Backspace), meaning
+// the module must stay dark for this boot. Declared here rather than in a shared
+// header because this keyboard has no <keyboard>.h and adding one would change
+// what QMK_KEYBOARD_H resolves to for the keymaps.
+bool yj_expansion_killed(void);
+void yj_expansion_kill_indicate(void);
+
 // ---- TPS43 anti-jitter: enable the chip's built-in filters that QMK leaves off -----
 // QMK's azoteq driver never touches these registers, so the chip runs with them at
 // power-on defaults — which is why a resting finger trembles. We turn them on after
@@ -104,6 +112,21 @@ static void tps43_apply_smoothing(void) {
 }
 
 void pointing_device_driver_init(void) {
+    // Boot override: this half was reset with its kill key held, so do not touch
+    // the module at all. Returning with active_module == MODULE_NONE is the same
+    // state a half with no module soldered on ends up in, which is a path this
+    // firmware already relies on -- GP0/GP1/GP2 stay unconfigured (high-Z), no I2C
+    // or PS/2 traffic is ever generated, and pointing_device_driver_get_report()
+    // hands the report straight back. Since pointing_device_send() re-zeroes the
+    // report every cycle (quantum/pointing_device/pointing_device.c:218), this
+    // half's contribution to the USB mouse report is identically zero -- so the
+    // data is neither read from the module nor emitted to the host.
+    if (yj_expansion_killed()) {
+        active_module = MODULE_NONE;
+        yj_expansion_kill_indicate(); // blink that key's led: "expansion off, you can let go"
+        return;
+    }
+
     // --- Phase 1: Azoteq TPS43 over I2C ---
     tps43_reset();
     i2c_init();
@@ -167,6 +190,29 @@ void pointing_device_driver_init(void) {
 #    define TP_DEADZONE 1
 #endif
 
+// ---- PS/2 packet decoding ------------------------------------------------------------
+// The PIO driver signals a bad frame (start / parity / stop) by setting ps2_error and
+// returning 0x00 -- at the return value a corrupted frame is indistinguishable from a
+// genuine 0x00 data byte. Ignoring ps2_error therefore corrupts the stream in two ways:
+// a rejected frame landing mid-packet is consumed as a real X or Y delta, and one landing
+// at packet-start returns 0x00, fails the header test and is silently skipped -- which
+// DROPS A BYTE, because the device really did transmit one in that slot. Every following
+// byte is then read one position early and the packet phase stays shifted. So we check
+// ps2_error on every read and abandon the packet when a frame is bad.
+//
+// If the pointer ever misbehaves again, trackpoint-diagnostics.md documents how to
+// re-add the instrumentation that measures this (frame counters + raw packet log) and
+// how to read the numbers. Diagnosed once on 2026-08-27; see that file for the case
+// record.
+
+// A partial packet is NORMAL: at a 10 ms poll interval the module's 3-byte burst is often
+// split across two polls, so the timeout must comfortably exceed one poll period. It is
+// only stale if nothing follows for far longer than that, meaning the byte stream stopped
+// mid-packet -- drop it so leftover bytes cannot shift the phase of the next real packet.
+#ifndef TP_PKT_IDLE_TIMEOUT_MS
+#    define TP_PKT_IDLE_TIMEOUT_MS 30
+#endif
+
 static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
     // The button state must be LATCHED here rather than taken from mouse_report.
     // PS/2 stream mode only emits a packet on movement or a button change, so a
@@ -174,26 +220,53 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
     // the driver is called with a zeroed report every poll
     // (transactions.c pointing_handlers_slave: get_report((report_mouse_t){0})),
     // so seeding from mouse_report.buttons would release a held button the moment
-    // the stick stops moving — i.e. the TrackPoint buttons would only work on the
+    // the stick stops moving -- i.e. the TrackPoint buttons would only work on the
     // half that happens to be plugged into USB.
-    static uint8_t latched_buttons = 0;
-    static uint8_t pkt[3];      // partial PS/2 packet carried across polls
-    static uint8_t pkt_len = 0; // bytes of pkt[] filled so far
+    static uint8_t  latched_buttons = 0;
+    static uint8_t  pkt[3];           // partial PS/2 packet carried across polls
+    static uint8_t  pkt_len      = 0; // bytes of pkt[] filled so far
+    static uint32_t last_byte_ms = 0; // when the last good byte arrived (staleness check)
 
     int16_t ax = 0;
     int16_t ay = 0;
 
+    // Discard a partial packet whose remaining bytes never arrived.
+    if (pkt_len != 0 && timer_elapsed32(last_byte_ms) > TP_PKT_IDLE_TIMEOUT_MS) {
+        pkt_len = 0;
+    }
+
     // Drain ONLY the bytes already in the ring buffer: every read is guarded by
     // pbuf_has_data(), so this never blocks waiting for the rest of a packet. That is the
-    // fix for touchpad lag when the touchpad half is the USB master — this function runs on
+    // fix for touchpad lag when the touchpad half is the USB master -- this function runs on
     // the TrackPoint SLAVE inside the master's synchronous fetch transaction, so a blocking
     // mid-packet read here stalls the MASTER's whole pointing loop and its own device (the
     // touchpad) goes janky. A half-received packet is kept in pkt[] and finished next poll.
-    // (The old code read the flags byte guarded but then read x and y unguarded.)
     while (pbuf_has_data()) {
+        // Clear ps2_error first: the driver only ever SETS it and nothing clears it, so a
+        // stale error left by an earlier call would make every later byte look corrupt.
+        ps2_error = PS2_ERR_NONE;
+
         uint8_t b = ps2_host_recv_response();
-        if (pkt_len == 0 && !(b & 0x08)) {
-            continue; // byte0 must have bit3 set; drop stray bytes to resync
+        if (ps2_error != PS2_ERR_NONE) {
+            // Corrupted frame. Its value (0x00) carries no information, so it must not be
+            // fed into the packet -- and it must not be silently skipped either, because
+            // the device really did transmit a byte in this slot. Abandoning the whole
+            // packet keeps the phase honest: we deliberately resync on the next header.
+            pkt_len = 0;
+            continue;
+        }
+        last_byte_ms = timer_read32();
+
+        if (pkt_len == 0) {
+            // Packet-boundary hunt. bit3 is always 1 in a mouse byte0; bits 6/7 are the
+            // X/Y overflow flags, which a TrackPoint essentially never sets. Testing all
+            // three cuts the chance of a random data byte being mistaken for a header from
+            // ~1/2 down to ~1/8, so a stream that lost a byte re-locks far sooner instead
+            // of staying shifted indefinitely. An overflowed packet is dropped too -- its
+            // deltas are meaningless by definition.
+            if ((b & 0xC8) != 0x08) {
+                continue;
+            }
         }
         pkt[pkt_len++] = b;
         if (pkt_len < 3) {
@@ -213,7 +286,7 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 
     // Deadzone ONLY when this (the TrackPoint) half is the split SLAVE. In that case the
     // report is forwarded to the other half (the master), which can re-apply the tiny
-    // resting ±residual across polls and turn it into slow drift — so we strip it here
+    // resting +/-residual across polls and turn it into slow drift -- so we strip it here
     // before it leaves. When this half is itself the USB master the report is applied
     // directly with no such amplification, so we leave it fully untouched to keep maximum
     // precision. Net effect: the deadzone engages only when the TrackPoint-less half is
@@ -265,17 +338,66 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 // genuine slow scroll returns 0 on sub-unit cycles, so a per-cycle reset would wipe the
 // backlog mid-scroll and re-break the slow case. Idle carry-over is cleared by a longer
 // zero-run timeout in tps43_get_report instead.
+//
+// SPEED IS SET BY TWO PARAMETERS, EACH OWNING A DIFFERENT REGIME -- change both together
+// or you only slow down half the range:
+//   - slow finger (accumulator cannot outrun the gate): rate = finger_speed / STEP, so
+//     scroll-per-millimetre-of-finger is 1/STEP. STEP alone sets this regime.
+//   - fast finger (backlog pinned at CAP): rate = 1000 / INTERVAL_MS, a hard ceiling.
+//     INTERVAL_MS alone sets this regime.
+// Scaling both by the same factor moves the whole curve uniformly. Current values are the
+// original 8 / 90 scaled by 1.5, i.e. every regime slowed to 2/3 speed (top speed
+// 11.1 -> 7.4 notch/s). To slow down further, keep multiplying BOTH by the same factor.
 #ifndef TPS43_SCROLL_STEP
-#    define TPS43_SCROLL_STEP 8 // raw units per notch (onset ~STEP/47.6 mm; bigger = less sensitive/slower)
+#    define TPS43_SCROLL_STEP 12 // raw units per notch (onset ~STEP/47.6 mm; bigger = less sensitive/slower)
 #endif
 #ifndef TPS43_SCROLL_INTERVAL_MS
-#    define TPS43_SCROLL_INTERVAL_MS 90 // min ms between notches = top speed (bigger = slower). ~7 notch/s (was 90; slowed 2x)
+#    define TPS43_SCROLL_INTERVAL_MS 135 // min ms between notches = top speed ceiling (bigger = slower). ~7.4 notch/s
 #endif
 #ifndef TPS43_SCROLL_CAP
-#    define TPS43_SCROLL_CAP (TPS43_SCROLL_STEP + TPS43_SCROLL_STEP / 2) // backlog clamp -> short coast only
+#    define TPS43_SCROLL_CAP (TPS43_SCROLL_STEP + TPS43_SCROLL_STEP / 2) // backlog clamp -> short coast only (tracks STEP)
 #endif
+// MUST stay greater than TPS43_SCROLL_INTERVAL_MS. This timeout clears the backlog after a
+// zero-run of raw input, while the rate gate withholds a notch for INTERVAL_MS. If the
+// timeout were the shorter of the two, a backlog that is already >= STEP would be wiped
+// before the gate ever let it out, silently swallowing the last notch of every flick. That
+// was not a live bug at the original 90/100 (gate < timeout), but raising INTERVAL_MS to
+// 135 crossed over it, so this moved to 150 to restore the ordering.
 #ifndef TPS43_SCROLL_IDLE_RESET_MS
-#    define TPS43_SCROLL_IDLE_RESET_MS 100 // drop leftover backlog after this long with no scroll input
+#    define TPS43_SCROLL_IDLE_RESET_MS 150 // drop leftover backlog after this long with no scroll input
+#endif
+
+// ---- Click stretch: make the one-cycle tap pulse survive the whole pipeline ----------
+// The chip reports single_tap / two_finger_tap as an EVENT that is set for exactly ONE
+// sensor cycle, and azoteq_iqs5xx_get_report turns that into buttons != 0 for exactly one
+// pointing cycle (~10 ms) and back to 0 on the next. press_and_hold is disabled (the
+// driver defaults AZOTEQ_IQS5XX_PRESS_AND_HOLD_ENABLE to false and config.h does not
+// override it), so a tap is a ~10 ms blip and nothing else -- there is no held state to
+// fall back on. That blip has to survive two independent samplers:
+//
+//   1. Split forwarding. When the pad is on the SLAVE half, this function runs in the
+//      slave's transaction handler at its own ~10 ms throttle, writing into split_shmem.
+//      The MASTER copies that into shared_mouse_report but only CONSUMES it inside
+//      pointing_device_task, which is itself throttled to POINTING_DEVICE_TASK_THROTTLE_MS
+//      (pointing_device.c: the COMBINED branch reads shared_mouse_report once per task).
+//      Two ~10 ms samplers running free of each other beat against one another: whenever
+//      the phases line up badly the pressed report is overwritten by the next (released)
+//      one before the master ever looks at it, and the click is dropped with no trace.
+//      That is the "sometimes it just doesn't click" failure, and it is phase-dependent,
+//      so it comes in runs rather than at random.
+//   2. The USB host, which sees a press and a release ~10 ms apart.
+//
+// Holding the buttons for a minimum of TPS43_CLICK_MIN_MS makes the pressed state wider
+// than either sampler's period, so neither can step over it. Cost: a click is
+// TPS43_CLICK_MIN_MS long instead of ~10 ms -- invisible to the user, and far below any
+// plausible double-tap interval (two finger LIFTS 50 ms apart is not physically
+// reachable), so double-click still resolves as two clicks.
+//
+// This does NOT rescue a tap the chip never recognised in the first place -- that is what
+// AZOTEQ_IQS5XX_TAP_TIME / _TAP_DISTANCE in config.h control. The two fixes are
+// independent and address different halves of the same symptom.
+#ifndef TPS43_CLICK_MIN_MS
+#    define TPS43_CLICK_MIN_MS 50 // minimum click duration in ms (0 disables the stretch)
 #endif
 
 // Accumulate raw deltas and emit delta/divisor, carrying the remainder so slow movement
@@ -348,7 +470,38 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
     r.h = tps43_scroll_rate(r.h, &acc_h, &scroll_notch_h);
     r.v = tps43_scroll_rate(r.v, &acc_v, &scroll_notch_v);
 
-    // buttons (tap / two-finger tap) pass through untouched. (Zoom is disabled in config.h.)
+    // Buttons: stretch the chip's one-cycle tap event to at least TPS43_CLICK_MIN_MS (see
+    // the comment block above the tunable). While the raw report still asserts a button we
+    // keep re-arming the timer, so a genuinely held button (if press_and_hold is ever
+    // enabled) is passed through and only its RELEASE is delayed by up to CLICK_MIN_MS.
+    // State is static and touched only from the pointing task / split transaction handler
+    // -- never from an ISR -- so no locking is needed.
+#if TPS43_CLICK_MIN_MS > 0
+    static uint8_t  held_buttons = 0;
+    static uint32_t held_since   = 0;
+    if (r.buttons != 0) {
+        held_buttons |= r.buttons;
+        held_since = timer_read32();
+    } else if (held_buttons != 0) {
+        // Cut the stretch short the moment a NEW touch starts moving. Without this, a tap
+        // followed within CLICK_MIN_MS by a finger landing and moving would arrive at the
+        // host as button-down + motion, i.e. exactly the accidental selection/drag that
+        // tap-to-drag was removed from keymap.c to avoid. This cannot eat a real click:
+        // single_tap fires on the LIFT, and on the lift cycle raw buttons != 0 (handled
+        // above), while the cycle after a lift reports zero fingers and therefore zero
+        // motion -- so x/y can only be non-zero here if a new finger is already moving.
+        // x/y are the deadzoned values from the cursor stage above, so the resting +/-1
+        // noise floor cannot trip it. Worst case (a spurious twitch right after the lift)
+        // degrades to the pre-stretch behaviour of a one-cycle click, never worse.
+        if (x != 0 || y != 0) {
+            held_buttons = 0;
+        } else if (timer_elapsed32(held_since) >= TPS43_CLICK_MIN_MS) {
+            held_buttons = 0;
+        }
+    }
+    r.buttons = held_buttons;
+#endif
+    // (Zoom is disabled in config.h, so BUTTON7/8 never appear here.)
     return r;
 }
 

@@ -81,25 +81,38 @@
 #define AZOTEQ_IQS5XX_ZOOM_ENABLE false
 
 // --- Tap-to-click sensitivity ---
-// Stop a MOVING finger from being misread as a tap/click. tap_distance is the max
-// travel (in sensor units) a touch may have and still count as a tap; driver default
-// is 0x19 (25 ≈ 0.5 mm), loose enough that a small drag registers as a click. Tighten
-// it so any real cursor motion cancels the tap. tap_time is the max touch duration for
-// a tap (ms). Lower either further if you still get accidental clicks; if real taps stop
-// registering, raise tap_distance back up a little.
-// (If you don't want tap-to-click at all — you have physical MBtn1/MBtn2 keys — set
-//  AZOTEQ_IQS5XX_TAP_ENABLE to false instead and delete these two lines.)
-#define AZOTEQ_IQS5XX_TAP_DISTANCE 0x0A // 10 (was 25) — finger must stay put to click
-#define AZOTEQ_IQS5XX_TAP_TIME 0x82     // 130 ms (was 150) — only quick touches count
+// These two are the ONLY gate on a click. AZOTEQ_IQS5XX_PRESS_AND_HOLD_ENABLE defaults to
+// false in the driver (azoteq_iqs5xx.c) and is not overridden here, so the chip's
+// `single_tap` event is the sole source of BUTTON1 — a touch that misses either threshold
+// produces NOTHING AT ALL, with no slower fallback gesture to catch it. That is why
+// over-tightening these shows up as "the click sometimes just doesn't happen".
+//
+// tap_time  = max touch DURATION (ms) that still counts as a tap.
+// tap_distance = max finger TRAVEL during the touch, in sensor units. The TPS43 is
+//   2048 counts over 43 mm => ~47.6 counts/mm, so the numbers below are sub-millimetre.
+//
+// History: both were tightened well below the driver defaults (0x96 = 150 ms / 0x19 = 25)
+// to stop a moving finger being misread as a click. 130 ms cut off the long tail of normal
+// taps (a deliberate/soft tap easily runs 150-250 ms) and 10 counts = 0.21 mm is less than
+// the centroid shift from the fingertip flattening on contact — so genuine taps were being
+// rejected. Loosened to 200 ms / 18 counts (0.38 mm): still tighter than the driver default
+// on distance, so real cursor motion (5 mm = ~240 counts) cancels the tap just as before.
+// If accidental clicks come back, walk tap_time down first (0xB4 = 180, 0xA0 = 160) — it is
+// the threshold a resting-but-not-moving finger crosses; distance only guards against drags.
+#define AZOTEQ_IQS5XX_TAP_DISTANCE 0x12 // 18 (~0.38 mm; was 10 = 0.21 mm, driver default 25)
+#define AZOTEQ_IQS5XX_TAP_TIME 0xC8     // 200 ms (was 130; driver default 150)
 
 // --- Two-finger scroll engagement distance ---
 // How far (in sensor units, ~47.6/mm on the TPS43 X axis) the two fingers must travel
 // before the CHIP declares a scroll gesture and starts emitting h/v. Driver default is
 // 0x32 = 50 (~1.05 mm), which felt like "small slow moves don't scroll — you must swipe
 // hard to trigger." 0x14 = 20 (~0.42 mm) engages a gentle scroll much sooner. This is a
-// separate register from tap_distance (0x0A above), so lowering it does NOT steal a
-// two-finger tap / right-click: a tap qualifies only while travel <= 10, which is below
-// 20, so a real tap can never cross the scroll threshold. (Trade-off: a sloppy two-finger
+// separate register from tap_distance (0x12 above), so lowering it does NOT steal a
+// two-finger tap / right-click: a tap qualifies only while travel <= 18 (tap_distance
+// above), which is still below 20, so a real tap cannot cross the scroll threshold. NOTE
+// the margin is now only 2 counts — if you raise tap_distance any further, raise this to
+// match (keep scroll_initial_distance > tap_distance) or a sloppy two-finger tap will
+// engage scroll. (Trade-off: a sloppy two-finger
 // tap that drifts 20-50 units may now emit a tiny stray scroll instead of nothing.)
 // Speed once engaged is handled separately in pointing.c (TPS43_SCROLL_*), not here.
 #define AZOTEQ_IQS5XX_SCROLL_INITIAL_DISTANCE 0x14
@@ -170,6 +183,7 @@
 // RGB matrix brightness cap (25/255 ≈ 10%, keeps total current well under 500mA)
 // lives in info.json as rgb_matrix.max_brightness / rgb_matrix.default.val —
 // redefining it here only produces "config.h is overwriting info.json" warnings.
+
 
 // RP2040 bootloader: double-tap the RESET button to enter UF2 mode
 #define RP2040_BOOTLOADER_DOUBLE_TAP_RESET

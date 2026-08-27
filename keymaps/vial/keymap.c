@@ -13,6 +13,26 @@
 #define FN_LAYER          1
 #define FN_SCROLL_DIVISOR 48
 
+// Y direction of the Fn+move scroll. The two pointing modules want OPPOSITE signs here,
+// because their "natural" scroll conventions genuinely differ:
+//
+//   TOUCHPAD (-1 is wrong, use +1): the chip's two-finger scroll feeds report.v straight
+//     from the Y delta with no negation (azoteq_iqs5xx.c: temp_report.v = COMBINE(y)),
+//     and the SAME Y delta also becomes report.y. In HID terms y>0 = cursor down and v>0 =
+//     scroll up, so two-finger scrolling on this pad means "finger down -> scroll up".
+//     Fn+one-finger has to match that or the two gestures fight each other.
+//   TRACKPOINT (+1 is wrong, use -1): pointing.c already converts the stick to HID sense
+//     (y>0 = down), so pushing the stick UP gives y<0. The classic stick convention is
+//     "push up -> scroll up", which needs the negation.
+//
+// This is a compile-time choice, not runtime: the Fn scroll runs in
+// pointing_device_task_user on the MASTER, over the already-combined report, and when the
+// module sits on the slave half the master has no idea which module produced those deltas
+// (pointing.c's active_module is per-half and is MODULE_NONE on a module-less master).
+// Making it automatic would need a custom split transaction to publish the slave's module
+// type. Currently set for the touchpad; flip to -1 if you swap the TrackPoint back in.
+#define FN_SCROLL_Y_SIGN  1
+
 // Gesture post-processing only applies to the pointing-device path.
 // During the PS/2 TrackPoint isolation test POINTING_DEVICE_ENABLE is off, so
 // this is compiled out (the stock ps2_mouse driver sends reports directly).
@@ -31,8 +51,8 @@ report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
         int16_t dv = scroll_ay / FN_SCROLL_DIVISOR;
         scroll_ax -= dh * FN_SCROLL_DIVISOR;
         scroll_ay -= dv * FN_SCROLL_DIVISOR;
-        mouse_report.h += dh;  // push right -> scroll right
-        mouse_report.v += -dv; // push up (y<0) -> scroll up
+        mouse_report.h += dh;                                  // move/push right -> scroll right (already matches two-finger)
+        mouse_report.v += (int16_t)(FN_SCROLL_Y_SIGN * dv);    // sign per FN_SCROLL_Y_SIGN above
         mouse_report.x = 0;
         mouse_report.y = 0;
         return mouse_report;

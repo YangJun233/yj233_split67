@@ -1,0 +1,354 @@
+--- a/pointing.c
++++ b/pointing.c
+@@ -19,6 +19,7 @@
+ // ============================================================================
+ 
+ #include "quantum.h"
++#include <string.h>
+ #include "pointing_device.h"
+ #include "i2c_master.h"
+ #include "sensors/azoteq_iqs5xx.h"
+@@ -190,20 +191,44 @@
+ #    define TP_DEADZONE 1
+ #endif
+ 
+-// ---- PS/2 packet decoding ------------------------------------------------------------
+-// The PIO driver signals a bad frame (start / parity / stop) by setting ps2_error and
+-// returning 0x00 -- at the return value a corrupted frame is indistinguishable from a
+-// genuine 0x00 data byte. Ignoring ps2_error therefore corrupts the stream in two ways:
+-// a rejected frame landing mid-packet is consumed as a real X or Y delta, and one landing
+-// at packet-start returns 0x00, fails the header test and is silently skipped -- which
+-// DROPS A BYTE, because the device really did transmit one in that slot. Every following
+-// byte is then read one position early and the packet phase stays shifted. So we check
+-// ps2_error on every read and abandon the packet when a frame is bad.
++// ---- PS/2 link health + payload counters --------------------------------------------
++// MEASURED 2026-08-27 on the misbehaving stick: ok=1050 err=0 rsy=0 ovf=0 stl=0 pkt=350.
++// 1050 == 350*3 exactly, and not one frame failed the driver's start/parity/stop check --
++// so the PS/2 link is byte-perfect and has never lost sync. That rules out the physical
++// layer (supply, pull-ups, solder joints) AND any framing/desync bug in this decoder as
++// the cause of the erratic cursor. Whatever is wrong is in the CONTENT the module sends,
++// or in what happens to it downstream.
+ //
+-// If the pointer ever misbehaves again, trackpoint-diagnostics.md documents how to
+-// re-add the instrumentation that measures this (frame counters + raw packet log) and
+-// how to read the numbers. Diagnosed once on 2026-08-27; see that file for the case
+-// record.
++// Kept in place because it is cheap and it is what proves the link stays healthy. The
++// payload counters below were added next to answer the follow-up question: what are the
++// actual flags / x / y values?
++typedef struct {
++    uint16_t ok;     // frames that passed the driver's start/parity/stop check
++    uint16_t err;    // frames the driver REJECTED -- physical layer health lives here
++    uint16_t resync; // bytes discarded while hunting for a packet boundary
++    uint16_t ovf;    // headers dropped because the X/Y overflow bits were set
++    uint16_t stale;  // partial packets dropped by the inter-packet idle timeout
++    uint16_t pkts;   // packets decoded successfully
++    // ---- payload observation ----
++    int16_t xmin, xmax; // extremes of the raw per-packet X delta
++    int16_t ymin, ymax; // extremes of the raw per-packet Y delta
++    uint8_t btnseen;    // OR of every button bit ever reported (a stuck button drags!)
++    uint8_t maxburst;   // most packets consumed in a SINGLE poll -- they are summed, so
++                        // a large burst multiplies into one huge cursor jump
++} tp_stats_t;
++
++static tp_stats_t tp_stats = {.xmin = INT16_MAX, .xmax = INT16_MIN, .ymin = INT16_MAX, .ymax = INT16_MIN};
++
++// Ring of the most recent raw packets, so the actual bytes can be inspected instead of
++// guessed at. This is the difference between "the link is fine" and "the module is
++// reporting sane numbers" -- the counters above only prove the former.
++#define TP_RAW_LOG 8
++static struct {
++    uint8_t f;
++    int16_t x, y;
++} tp_raw[TP_RAW_LOG];
++static uint8_t tp_raw_head  = 0;
++static uint8_t tp_raw_count = 0;
+ 
+ // A partial packet is NORMAL: at a 10 ms poll interval the module's 3-byte burst is often
+ // split across two polls, so the timeout must comfortably exceed one poll period. It is
+@@ -227,12 +252,14 @@
+     static uint8_t  pkt_len      = 0; // bytes of pkt[] filled so far
+     static uint32_t last_byte_ms = 0; // when the last good byte arrived (staleness check)
+ 
+-    int16_t ax = 0;
+-    int16_t ay = 0;
++    int16_t ax    = 0;
++    int16_t ay    = 0;
++    uint8_t burst = 0; // packets consumed in THIS poll
+ 
+     // Discard a partial packet whose remaining bytes never arrived.
+     if (pkt_len != 0 && timer_elapsed32(last_byte_ms) > TP_PKT_IDLE_TIMEOUT_MS) {
+         pkt_len = 0;
++        tp_stats.stale++;
+     }
+ 
+     // Drain ONLY the bytes already in the ring buffer: every read is guarded by
+@@ -252,9 +279,11 @@
+             // fed into the packet -- and it must not be silently skipped either, because
+             // the device really did transmit a byte in this slot. Abandoning the whole
+             // packet keeps the phase honest: we deliberately resync on the next header.
++            tp_stats.err++;
+             pkt_len = 0;
+             continue;
+         }
++        tp_stats.ok++;
+         last_byte_ms = timer_read32();
+ 
+         if (pkt_len == 0) {
+@@ -262,10 +291,14 @@
+             // X/Y overflow flags, which a TrackPoint essentially never sets. Testing all
+             // three cuts the chance of a random data byte being mistaken for a header from
+             // ~1/2 down to ~1/8, so a stream that lost a byte re-locks far sooner instead
+-            // of staying shifted indefinitely. An overflowed packet is dropped too -- its
+-            // deltas are meaningless by definition.
+-            if ((b & 0xC8) != 0x08) {
+-                continue;
++            // of staying shifted indefinitely.
++            if (!(b & 0x08)) {
++                tp_stats.resync++;
++                continue; // not a header -- we are out of phase, keep hunting
++            }
++            if (b & 0xC0) {
++                tp_stats.ovf++;
++                continue; // header, but X/Y overflowed: those deltas are meaningless
+             }
+         }
+         pkt[pkt_len++] = b;
+@@ -282,8 +315,25 @@
+         ax += x;
+         ay += y;
+         latched_buttons = flags & PS2_MOUSE_BTN_MASK; // L/R/M -> button1/2/3
++        tp_stats.pkts++;
++        burst++;
++
++        // ---- payload observation ----
++        if (x < tp_stats.xmin) tp_stats.xmin = x;
++        if (x > tp_stats.xmax) tp_stats.xmax = x;
++        if (y < tp_stats.ymin) tp_stats.ymin = y;
++        if (y > tp_stats.ymax) tp_stats.ymax = y;
++        tp_stats.btnseen |= flags & PS2_MOUSE_BTN_MASK;
++
++        tp_raw[tp_raw_head].f = flags;
++        tp_raw[tp_raw_head].x = x;
++        tp_raw[tp_raw_head].y = y;
++        tp_raw_head           = (uint8_t)((tp_raw_head + 1) % TP_RAW_LOG);
++        if (tp_raw_count < TP_RAW_LOG) tp_raw_count++;
+     }
+ 
++    if (burst > tp_stats.maxburst) tp_stats.maxburst = burst;
++
+     // Deadzone ONLY when this (the TrackPoint) half is the split SLAVE. In that case the
+     // report is forwarded to the other half (the master), which can re-apply the tiny
+     // resting +/-residual across polls and turn it into slow drift -- so we strip it here
+@@ -302,6 +352,137 @@
+     return mouse_report;
+ }
+ 
++// ---- Link diagnostics readout -------------------------------------------------------
++// Types the counters as keystrokes, so no console build or extra tooling is needed --
++// focus any text field and press the key bound to Vial's "Custom 0" / "Custom 2".
++//
++// IMPORTANT: this runs on the USB MASTER. To read the TrackPoint half's counters, plug
++// THAT half into USB (the other half may stay disconnected).
++//
++// Link health (already answered: the link is clean):
++//   err large next to ok  -> physical layer failing (supply / pull-ups / solder joint)
++//   err ~0 but rsy large  -> bytes intact but packet phase wrong (a framing bug)
++//   ok ~0                 -> module silent: unpowered, or reporting never re-enabled
++//
++// Payload (what we are looking at now):
++//   pkt rising while the stick is UNTOUCHED -> the module reports motion on its own:
++//        a failed strain gauge / drift compensation, i.e. a hardware fault in the module
++//   x or y pinned at +/-255ish -> the module is saturating on that axis
++//   btn non-zero when nothing is pressed -> a stuck button; motion then becomes a DRAG,
++//        which on screen looks like wild flickering selection rather than a moving cursor
++//   brst large -> many packets summed into one poll, multiplying into a single big jump
++static void tp_put_str(char *dst, uint8_t *pos, const char *s) {
++    while (*s) {
++        dst[(*pos)++] = *s++;
++    }
++}
++
++static void tp_put_u16(char *dst, uint8_t *pos, const char *label, uint16_t v) {
++    tp_put_str(dst, pos, label);
++    char    tmp[6];
++    uint8_t n = 0;
++    do {
++        tmp[n++] = (char)('0' + v % 10);
++        v /= 10;
++    } while (v);
++    while (n) {
++        dst[(*pos)++] = tmp[--n];
++    }
++    dst[(*pos)++] = ' ';
++}
++
++static void tp_put_i16(char *dst, uint8_t *pos, const char *label, int16_t v) {
++    tp_put_str(dst, pos, label);
++    int32_t n = v;
++    if (n < 0) {
++        dst[(*pos)++] = '-';
++        n             = -n;
++    } else {
++        dst[(*pos)++] = '+';
++    }
++    char    tmp[8];
++    uint8_t k = 0;
++    do {
++        tmp[k++] = (char)('0' + n % 10);
++        n /= 10;
++    } while (n);
++    while (k) {
++        dst[(*pos)++] = tmp[--k];
++    }
++}
++
++static void tp_put_hex8(char *dst, uint8_t *pos, uint8_t v) {
++    static const char h[] = "0123456789ABCDEF";
++    dst[(*pos)++]         = h[v >> 4];
++    dst[(*pos)++]         = h[v & 0x0F];
++}
++
++void tp_stats_send(void) {
++    char    buf[160];
++    uint8_t p = 0;
++
++    tp_put_str(buf, &p, active_module == MODULE_TRACKPOINT ? "TP " : (active_module == MODULE_TPS43 ? "PAD " : "NONE "));
++    tp_put_u16(buf, &p, "ok=", tp_stats.ok);
++    tp_put_u16(buf, &p, "err=", tp_stats.err);
++    tp_put_u16(buf, &p, "rsy=", tp_stats.resync);
++    tp_put_u16(buf, &p, "ovf=", tp_stats.ovf);
++    tp_put_u16(buf, &p, "stl=", tp_stats.stale);
++    tp_put_u16(buf, &p, "pkt=", tp_stats.pkts);
++    if (tp_stats.pkts) {
++        tp_put_i16(buf, &p, "x=", tp_stats.xmin);
++        tp_put_i16(buf, &p, "..", tp_stats.xmax);
++        buf[p++] = ' ';
++        tp_put_i16(buf, &p, "y=", tp_stats.ymin);
++        tp_put_i16(buf, &p, "..", tp_stats.ymax);
++        buf[p++] = ' ';
++    }
++    tp_put_str(buf, &p, "btn=");
++    tp_put_hex8(buf, &p, tp_stats.btnseen);
++    buf[p++] = ' ';
++    tp_put_u16(buf, &p, "brst=", tp_stats.maxburst);
++    buf[p] = '\0';
++
++    send_string(buf);
++}
++
++// Types the last few raw packets, oldest first: "f08 x+3 y-2 | f18 x-128 y+0 | ..."
++// f is byte0 in hex (bit3 always set; bits 0-2 buttons; bit4/5 X/Y sign; bit6/7 overflow).
++void tp_raw_send(void) {
++    char    buf[200];
++    uint8_t p = 0;
++
++    if (tp_raw_count == 0) {
++        send_string("TP raw: none");
++        return;
++    }
++
++    // Walk from the oldest retained entry to the newest.
++    uint8_t start = (uint8_t)((tp_raw_head + TP_RAW_LOG - tp_raw_count) % TP_RAW_LOG);
++    for (uint8_t n = 0; n < tp_raw_count; n++) {
++        uint8_t idx = (uint8_t)((start + n) % TP_RAW_LOG);
++        if (n) {
++            tp_put_str(buf, &p, " | ");
++        }
++        buf[p++] = 'f';
++        tp_put_hex8(buf, &p, tp_raw[idx].f);
++        tp_put_i16(buf, &p, " x", tp_raw[idx].x);
++        tp_put_i16(buf, &p, " y", tp_raw[idx].y);
++    }
++    buf[p] = '\0';
++
++    send_string(buf);
++}
++
++void tp_stats_reset(void) {
++    memset(&tp_stats, 0, sizeof(tp_stats));
++    tp_stats.xmin = INT16_MAX;
++    tp_stats.xmax = INT16_MIN;
++    tp_stats.ymin = INT16_MAX;
++    tp_stats.ymax = INT16_MIN;
++    tp_raw_head   = 0;
++    tp_raw_count  = 0;
++}
++
+ // ---- TPS43 report shaping: tame sensitivity and resting jitter --------------------
+ // The bare Azoteq driver returns raw relative deltas with no smoothing, which gives two
+ // problems on this pad: (1) it is far too sensitive (a small finger move throws the
+--- a/keymaps/vial/keymap.c
++++ b/keymaps/vial/keymap.c
+@@ -79,6 +79,45 @@
+ }
+ #endif // POINTING_DEVICE_ENABLE
+ 
++// ---- TrackPoint PS/2 link diagnostics -----------------------------------------------
++// TP_STAT types the PS/2 frame counters into whatever text field has focus, so the link
++// can be measured without a console build or any extra tooling. Bind these two in Vial as
++// "Custom 0" / "Custom 1", focus a text editor, tap TP_ZERO to clear, use the stick for a
++// while, then tap TP_STAT to print. See tp_stats_send() in pointing.c for how to read the
++// numbers.
++//
++// NOTE: process_record_user runs on the USB MASTER only, so plug the half that CARRIES
++// the TrackPoint into USB when sampling — otherwise you are reading the counters of the
++// half that has no stick (which will simply show NONE with everything at zero).
++#ifdef POINTING_DEVICE_ENABLE
++extern void tp_stats_send(void);
++extern void tp_stats_reset(void);
++extern void tp_raw_send(void);
++
++enum custom_keycodes {
++    TP_STAT = QK_KB_0, // Vial "Custom 0" — print counters as keystrokes
++    TP_ZERO,           // Vial "Custom 1" — reset counters to zero
++    TP_RAW,            // Vial "Custom 2" — print the last raw packets
++};
++
++bool process_record_user(uint16_t keycode, keyrecord_t *record) {
++    if (!record->event.pressed) {
++        return true;
++    }
++    switch (keycode) {
++        case TP_STAT:
++            tp_stats_send();
++            return false;
++        case TP_ZERO:
++            tp_stats_reset();
++            return false;
++        case TP_RAW:
++            tp_raw_send();
++            return false;
++    }
++    return true;
++}
++#endif // POINTING_DEVICE_ENABLE
+ 
+ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
+ 
+--- a/keymaps/vial/vial.json
++++ b/keymaps/vial/vial.json
+@@ -105,5 +105,22 @@
+         "9,7"
+       ]
+     ]
+-  }
++  },
++  "customKeycodes": [
++    {
++      "name": "TP_STAT",
++      "title": "Print TrackPoint PS/2 link counters as keystrokes",
++      "shortName": "TPSTAT"
++    },
++    {
++      "name": "TP_ZERO",
++      "title": "Reset TrackPoint PS/2 link counters",
++      "shortName": "TPZERO"
++    },
++    {
++      "name": "TP_RAW",
++      "title": "Print the last raw TrackPoint packets",
++      "shortName": "TPRAW"
++    }
++  ]
+ }

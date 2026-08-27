@@ -37,14 +37,50 @@ qmk compile -kb yj233_split67 -km vial
 
 **进入 bootloader**：本板支持双击 `RESET` 进入 UF2 模式（会挂载成 U 盘 `RPI-RP2`）。
 
-### 左半
+### ⚠️ WSL2：`qmk flash` 用不了，改用 `flash_wsl.sh`
+
+在 WSL2 下 `qmk flash -bl uf2-split-*` 会永远卡在：
+
+```
+Flashing for bootloader: rp2040
+Waiting for drive to deploy...
+```
+
+原因在 `util/uf2conv.py` 的 `get_drives()`——Linux 分支只扫这几个目录：
+
+```python
+searchpaths = ["/media"]
+elif sys.platform == "linux":
+    searchpaths += ["/media/" + os.environ["USER"], '/run/media/' + os.environ["USER"]]
+```
+
+而 `RPI-RP2` 这个 U 盘是 **Windows** 挂载的（拿到一个盘符），WSL 侧 `/media` 永远是空的；而且 WSL2 **不会自动挂载热插拔的驱动器**，`/mnt` 下只有开机时就存在的盘。所以那个循环等不到东西。
+
+用本目录的脚本代替，它编译完通过 `powershell.exe` 找盘符并复制，不需要 `sudo mount`：
+
+```bash
+./keyboards/yj233_split67/flash_wsl.sh right   # 看到提示后再双击 RESET
+./keyboards/yj233_split67/flash_wsl.sh left
+```
+
+复制到最后 PowerShell 报「设备已断开」是正常的——板子写完就自己重启了。
+
+> 另一个坑：如果 `qmk` 装在 venv 里（而不是 `pipx`／系统包），记得软链到 PATH 上，否则会 `Command 'qmk' not found`：
+> ```bash
+> ln -sfn <venv>/bin/qmk ~/.local/bin/qmk
+> ```
+> venv 里 `bin/qmk` 的 shebang 是绝对路径，走软链接照样用 venv 的解释器。
+
+下面两节的 `qmk flash` 适用于**原生 Linux / macOS**。
+
+### 左半（原生 Linux / macOS）
 
 ```bash
 # 左半插 USB，双击 RESET 进 bootloader
 qmk flash -kb yj233_split67 -km vial -bl uf2-split-left
 ```
 
-### 右半
+### 右半（原生 Linux / macOS）
 
 ```bash
 # 右半插 USB，双击 RESET 进 bootloader
@@ -61,7 +97,7 @@ qmk flash -kb yj233_split67 -km vial -bl uf2-split-right
 
 后果：左半会读到 handedness = 0（右半），于是用错矩阵引脚，整半按键错乱。
 
-**规避办法**：只要每次都用 `-bl uf2-split-left` / `-bl uf2-split-right` 烧录，固件里就带着 `INIT_EE_HANDS_*`，每次开机都会把标志重新写回去，**对 Bootmagic 免疫**。反之，如果烧的是不带 `-bl` 的普通固件，一旦触发 Bootmagic 就必须重新用 `-bl uf2-split-*` 烧一次才能恢复。
+**规避办法**：只要烧进去的固件带着 `INIT_EE_HANDS_*`（`-bl uf2-split-left/right`，或 `flash_wsl.sh` / `EXTRAFLAGS=-DINIT_EE_HANDS_*` 这套等价做法），每次开机都会把标志重新写回去，**对 Bootmagic 免疫**。反之，如果烧的是不带这个宏的普通固件，一旦触发 Bootmagic 就必须重新烧一次带宏的才能恢复。
 
 ### 手动拖 UF2（不用 qmk flash）
 
@@ -75,6 +111,10 @@ qmk compile -kb yj233_split67 -km vial -e EXTRAFLAGS=-DINIT_EE_HANDS_RIGHT   # �
 编译输出里出现 `#pragma message: Faking EE_HANDS for left hand` 就说明宏生效了。
 
 两次会覆盖同名 `.uf2`，请「编一个、拖一个」，别搞混。
+
+WSL2 下想手动拖，在 Windows 资源管理器里打开仓库（`wslpath -w .` 可以得到 UNC 路径，形如
+`\\wsl.localhost\<发行版>\home\<用户>\...\vial-qmk`），把根目录的 `yj233_split67_vial.uf2`
+拖到 `RPI-RP2` 盘即可。
 
 ## 验证
 
@@ -160,6 +200,35 @@ QMK 的 COL2ROW 扫描每行做三件事（`quantum/matrix.c` 的 `matrix_read_c
 再叠加 `SPLIT_USB_TIMEOUT`（默认 2000ms，从机要等这么久才确认自己不是主机），所以**从机那半大约 4 秒后才完全就绪**。表现是：插上 USB 后主机那半立刻能打字，另一半过几秒才活过来。这不影响最终功能，介意的话可以调小 `POINTING_DETECT_RETRIES` 或 `SPLIT_USB_TIMEOUT`。
 
 若某天把模块装在右半且安装方向和左半不同，用 `POINTING_DEVICE_ROTATION_*_RIGHT` / `POINTING_DEVICE_INVERT_*_RIGHT` 单独校正右半，不会影响左半。
+
+### 指点杆行为异常时的排查
+
+指针乱跳 / 某个方向不动 / 静止时自己漂 / 完全没输出 —— 见 [`trackpoint-diagnostics.md`](trackpoint-diagnostics.md)。
+那份文档配一个 `trackpoint-diagnostics.patch`，打上去就能把 PS/2 链路的帧计数和原始包读出来（结果直接当键盘输入敲进文本框，不需要 console 固件），查完 `patch -R` 撤掉。
+
+### 开机应急：临时禁用某一半的拓展模块
+
+触摸板 / 指点杆抽风把鼠标顶得到处跑的时候，可以把**那一半**的拓展模块整个关掉，不用装任何上位机软件、也不用重刷固件：
+
+| 半边 | 按住的键 | 矩阵位置 |
+| --- | --- | --- |
+| 左半 | `Delete` | `[3,6]` |
+| 右半 | `Backspace` | `[8,0]` |
+
+**操作**：按住该半的那个键 → 按一下该半的 RESET 按钮（单击，不是双击；双击是进 UF2）→ 那颗按键自己的灯会红闪 3 下（约 600ms）→ 看到闪灯就可以松手。
+
+闪完之后，这一半的拓展模块**这次开机全程不工作**：不做 I2C / PS-2 探测、不配置 GP0/GP1/GP2、不轮询、对 USB 鼠标报告的贡献恒为全零。等于这一半"没装模块"（`active_module = MODULE_NONE`，本来就是没装模块时走的那条路）。顺带的好处是这一半省掉了上面说的 1.6–2 秒探测耗时，开机反而更快。
+
+**不写 EEPROM，不持久**：下次正常 reset / 重新上电就自动恢复启用。安全状态（拓展开着）永远是默认值，不会把自己锁死。
+
+几点要知道的：
+
+- 只影响拓展模块。物理的 `MBtn1` / `MBtn2` 键照常能用——它们走 mousekey 通道，和 `active_module` 无关（`pointing_device.c:338` 是在驱动报告之后才 OR 进来的）。
+- 只关**这一半**。两半分别关，互不影响；模块装在哪半就关哪半。
+- 用的是**物理矩阵坐标**而不是键码：开机那一刻 Vial 的动态键位还不是权威，而且在 Vial 里把 Delete / Backspace 改到别处也不该让这个应急开关跟着跑。
+- 按键要在**按下 RESET 的那一刻**就已经按住；采样发生在 bootmagic 的两次去抖扫描之后（`quantum/bootmagic/bootmagic.c`），即开机极早期。
+- 红闪只是"生效了 / 可以松手了"的提示，**不是硬保护**：如果闪完还继续按着不放，主循环开始扫描后这个键会照常被当成 Backspace / Delete 打出去。看到闪灯就松手。
+- 实现见 `yj233_split67.c` 的 `bootmagic_should_reset()` 覆盖（采样 + 保留原版 Esc 清 EEPROM 行为）和 `pointing.c` 的 `pointing_device_driver_init()` 开头。因为采样点挂在 bootmagic 上，`BOOTMAGIC_ENABLE` 必须保持开启——关掉会让这段代码变成永远不执行的死代码，所以那里放了一个 `#error` 直接编译报错。
 
 ## RGB（左右同步）
 
