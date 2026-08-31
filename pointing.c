@@ -316,8 +316,21 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 #ifndef TPS43_CURSOR_DIVISOR
 #    define TPS43_CURSOR_DIVISOR 2 // cursor speed = raw / N  (bigger = slower; 1 = full speed)
 #endif
+// Resting-jitter deadzone. NOW OFF BY DEFAULT, and it must stay off unless resting tremble
+// actually comes back. The clip runs BEFORE the accumulator, so whatever it zeroes is gone for
+// good -- it does not survive as a remainder. During slow movement the chip's per-cycle delta IS
+// mostly +/-1 (a finger at 2 mm/s covers 0.02 mm per 10 ms cycle = 0.95 counts at 47.6 counts/mm),
+// so a value of 1 threw away nearly the whole slow-motion signal: the cursor sat still, then
+// jumped on the occasional cycle that happened to report 2. That is the "移动不均匀 / 不跟手"
+// symptom this is set to 0 to fix.
+//
+// Resting tremble is still handled -- by the accumulate-and-divide in tps43_scale, which is a
+// zero-mean low-pass: oscillating noise (+1,-1,+1,...) sums back toward zero and emits nothing,
+// while sustained motion in one direction accumulates and gets through. That filter keeps the
+// information; the deadzone destroyed it. If tremble does return, prefer raising
+// TPS43_CURSOR_DIVISOR before setting this back to 1.
 #ifndef TPS43_JITTER_DEADZONE
-#    define TPS43_JITTER_DEADZONE 1 // drop resting |cursor delta| <= this (0 disables)
+#    define TPS43_JITTER_DEADZONE 0 // drop resting |cursor delta| <= this (0 disables)
 #endif
 
 // ---- Scroll: constant-RATE limiter (not a divisor) ---------------------------------
@@ -345,14 +358,16 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 //     scroll-per-millimetre-of-finger is 1/STEP. STEP alone sets this regime.
 //   - fast finger (backlog pinned at CAP): rate = 1000 / INTERVAL_MS, a hard ceiling.
 //     INTERVAL_MS alone sets this regime.
-// Scaling both by the same factor moves the whole curve uniformly. Current values are the
-// original 8 / 90 scaled by 1.5, i.e. every regime slowed to 2/3 speed (top speed
-// 11.1 -> 7.4 notch/s). To slow down further, keep multiplying BOTH by the same factor.
+// Scaling both by the same factor moves the whole curve uniformly. History: original 8 / 90
+// -> 12 / 135 (x1.5, every regime to 2/3 speed) -> now 6 / 68, i.e. both halved from 12 / 135
+// so the whole curve is exactly 2x the previous speed (top speed 7.4 -> 14.7 notch/s, and
+// scroll-per-millimetre doubled as well). To change speed again, keep multiplying BOTH by the
+// same factor -- and re-check the IDLE_RESET_MS > INTERVAL_MS ordering noted below.
 #ifndef TPS43_SCROLL_STEP
-#    define TPS43_SCROLL_STEP 12 // raw units per notch (onset ~STEP/47.6 mm; bigger = less sensitive/slower)
+#    define TPS43_SCROLL_STEP 6 // raw units per notch (onset ~STEP/47.6 mm; bigger = less sensitive/slower)
 #endif
 #ifndef TPS43_SCROLL_INTERVAL_MS
-#    define TPS43_SCROLL_INTERVAL_MS 135 // min ms between notches = top speed ceiling (bigger = slower). ~7.4 notch/s
+#    define TPS43_SCROLL_INTERVAL_MS 68 // min ms between notches = top speed ceiling (bigger = slower). ~14.7 notch/s
 #endif
 #ifndef TPS43_SCROLL_CAP
 #    define TPS43_SCROLL_CAP (TPS43_SCROLL_STEP + TPS43_SCROLL_STEP / 2) // backlog clamp -> short coast only (tracks STEP)
@@ -362,7 +377,9 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 // timeout were the shorter of the two, a backlog that is already >= STEP would be wiped
 // before the gate ever let it out, silently swallowing the last notch of every flick. That
 // was not a live bug at the original 90/100 (gate < timeout), but raising INTERVAL_MS to
-// 135 crossed over it, so this moved to 150 to restore the ordering.
+// 135 crossed over it, so this moved to 150 to restore the ordering. At the current 68 the
+// margin is wide again (150 > 68); leave it at 150 -- lowering it toward INTERVAL_MS would
+// re-open the swallowed-last-notch bug.
 #ifndef TPS43_SCROLL_IDLE_RESET_MS
 #    define TPS43_SCROLL_IDLE_RESET_MS 150 // drop leftover backlog after this long with no scroll input
 #endif
@@ -439,12 +456,67 @@ static inline int16_t tps43_scroll_rate(int16_t delta, int16_t *accum, uint32_t 
     return 0;
 }
 
+// Build the mouse report from ONE base-data read, keeping the finger count. This is what
+// azoteq_iqs5xx_get_report() does, minus the part where it drops number_of_fingers before
+// returning. The finger count is what the click stretch below uses to decide a new touch has
+// started -- it cannot use the shaped x/y for that, because TPS43_JITTER_DEADZONE is 0 and
+// those carry the resting +/-1 tremble (see the click-stretch comment). Taking both out of the
+// same single I2C transaction also means the count and the gesture bits cannot disagree.
+// Only the gestures this board actually enables are decoded: swipes
+// (AZOTEQ_IQS5XX_SWIPE_X/Y_ENABLE) and zoom (AZOTEQ_IQS5XX_ZOOM_ENABLE) are false, and
+// press_and_hold defaults false (verified in drivers/sensors/azoteq_iqs5xx.c), so those
+// branches would be dead code here. The else-if ordering and the number_of_fingers == 1 guard
+// on cursor motion are kept identical to the driver's, so nothing about the existing behaviour
+// changes.
+// Returns false if the cycle carried no usable data; on such a cycle the report and the finger
+// count are both zeroed, which the click stretch treats as "keep stretching" -- the safe way
+// round for a NAK.
+static bool tps43_read_raw(report_mouse_t *out, uint8_t *fingers_out) {
+    report_mouse_t            r    = {0};
+    azoteq_iqs5xx_base_data_t base = {0};
+
+    *fingers_out = 0;
+    *out         = r;
+    if (azoteq_iqs5xx_get_base_data(&base) != I2C_STATUS_SUCCESS) {
+        return false; // NAK or bad read: no information this cycle, state must not advance
+    }
+    *fingers_out = base.number_of_fingers;
+
+    int16_t raw_x = AZOTEQ_IQS5XX_COMBINE_H_L_BYTES(base.x.h, base.x.l);
+    int16_t raw_y = AZOTEQ_IQS5XX_COMBINE_H_L_BYTES(base.y.h, base.y.l);
+
+    if (base.gesture_events_0.single_tap) {
+        r.buttons = pointing_device_handle_buttons(r.buttons, true, POINTING_DEVICE_BUTTON1);
+    } else if (base.gesture_events_1.two_finger_tap) {
+        r.buttons = pointing_device_handle_buttons(r.buttons, true, POINTING_DEVICE_BUTTON2);
+    } else if (base.gesture_events_1.scroll) {
+        r.h = CONSTRAIN_HID(raw_x);
+        r.v = CONSTRAIN_HID(raw_y);
+    }
+    if (base.number_of_fingers == 1) {
+        r.x = CONSTRAIN_HID_XY(raw_x);
+        r.y = CONSTRAIN_HID_XY(raw_y);
+    }
+    *out = r;
+    return true;
+}
+
 static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
     static int16_t  acc_x = 0, acc_y = 0, acc_h = 0, acc_v = 0;
     static uint32_t scroll_notch_h = 0, scroll_notch_v = 0; // last-notch timestamps
     static uint32_t scroll_last_input = 0;                  // last cycle with scroll input
 
-    report_mouse_t r = azoteq_iqs5xx_get_report(mouse_report);
+    // mouse_report is unused: the chip's report is absolute-per-cycle, and the driver it
+    // replaced ignored the incoming buttons too (it built its report from {0}).
+    (void)mouse_report;
+
+    uint8_t        fingers = 0;
+    report_mouse_t r       = {0};
+    // The return value distinguishes a failed read from a genuinely idle cycle. Nothing needs
+    // that distinction any more: a failed read zeroes both the report and the finger count, and
+    // the click stretch below treats fingers == 0 as "continue stretching", which is the safe
+    // direction for a NAK. Discarded explicitly so it does not read as an oversight.
+    (void)tps43_read_raw(&r, &fingers);
 
     // Cursor: deadzone the resting noise floor first (so it never enters the
     // accumulator), then slow + smooth. x/y are only non-zero during single-finger
@@ -483,17 +555,17 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
         held_buttons |= r.buttons;
         held_since = timer_read32();
     } else if (held_buttons != 0) {
-        // Cut the stretch short the moment a NEW touch starts moving. Without this, a tap
-        // followed within CLICK_MIN_MS by a finger landing and moving would arrive at the
-        // host as button-down + motion, i.e. exactly the accidental selection/drag that
-        // tap-to-drag was removed from keymap.c to avoid. This cannot eat a real click:
-        // single_tap fires on the LIFT, and on the lift cycle raw buttons != 0 (handled
-        // above), while the cycle after a lift reports zero fingers and therefore zero
-        // motion -- so x/y can only be non-zero here if a new finger is already moving.
-        // x/y are the deadzoned values from the cursor stage above, so the resting +/-1
-        // noise floor cannot trip it. Worst case (a spurious twitch right after the lift)
-        // degrades to the pre-stretch behaviour of a one-cycle click, never worse.
-        if (x != 0 || y != 0) {
+        // End the stretch as soon as a NEW finger is on the pad, so the click hands over
+        // cleanly to whatever comes next (a drag, or a second click).
+        //
+        // This used to test the shaped deltas (x/y) instead, on the reasoning that the
+        // deadzone had already removed the resting noise floor. TPS43_JITTER_DEADZONE is 0
+        // now -- it was destroying slow movement -- so x/y carry the raw +/-1 tremble again
+        // and that test would fire on noise, cutting every click back to one cycle and
+        // re-opening the dropped-click problem CLICK_MIN_MS exists to fix. The finger count
+        // is the signal actually wanted here and it does not depend on any shaping stage.
+        // On a failed read fingers is 0, so the stretch simply continues -- the safe way round.
+        if (fingers >= 1) {
             held_buttons = 0;
         } else if (timer_elapsed32(held_since) >= TPS43_CLICK_MIN_MS) {
             held_buttons = 0;
