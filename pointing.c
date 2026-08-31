@@ -178,7 +178,10 @@ void pointing_device_driver_init(void) {
 // ---- TrackPoint tunables ------------------------------------------------------------
 // Pointer speed multiplier. The stick's raw per-report deltas are small; scale them up.
 #ifndef TP_SPEED_MULT
-#    define TP_SPEED_MULT 3 // pointer speed multiplier (keymap.c FN_SCROLL_DIVISOR tracks this: 8 * mult)
+// Scaling the CURSOR here also scales what keymap.c's Fn one-finger scroll receives, since
+// that gesture is built from the cursor delta -- FN_SCROLL_DIVISOR is 16 * this. Unrelated
+// to the two-finger scroll, which is shaped by TPS43_SCROLL_* below and never touches x/y.
+#    define TP_SPEED_MULT 3 // pointer speed multiplier
 #endif
 // Resting deadzone: drop |delta| <= this per poll. The stick emits a tiny ±1-count idle
 // residual. On the half that is USB master it's applied once and is invisible; but when
@@ -333,7 +336,13 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 #    define TPS43_JITTER_DEADZONE 0 // drop resting |cursor delta| <= this (0 disables)
 #endif
 
-// ---- Scroll: constant-RATE limiter (not a divisor) ---------------------------------
+// ---- TWO-FINGER scroll: constant-RATE limiter (not a divisor) ----------------------
+// SCOPE: this shapes the chip's two-finger scroll gesture ONLY, whose job on this board is
+// small, precise scrolling. The Fn + one-finger gesture is a different feature for
+// long-distance scrolling, lives in keymaps/vial/keymap.c, is built from x/y rather than
+// h/v, and shares none of the constants below. Tune the two separately; do not try to make
+// their speeds match.
+//
 // Why not a divisor: the driver's r.h/r.v is the RAW per-cycle finger delta during a
 // chip-detected scroll gesture, i.e. proportional to finger velocity. A divisor r/N is a
 // linear gearbox: it rescales but cannot bound peak speed, so a fast flick still flings
