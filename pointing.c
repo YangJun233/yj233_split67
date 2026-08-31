@@ -336,6 +336,65 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 #    define TPS43_JITTER_DEADZONE 0 // drop resting |cursor delta| <= this (0 disables)
 #endif
 
+// ---- Two-finger scroll misread as ONE finger: the cursor teleport that follows ---------
+// During a two-finger scroll the chip intermittently reports number_of_fingers == 1 for a
+// cycle or two. That is a documented sensor behaviour, not a wiring fault: datasheet 5.7
+// (Multi-touch Finger Split) says two fingers whose contact polygons touch "could have
+// areas touching, which would merge them incorrectly into a single point", and how hard the
+// chip tries to separate them is the finger-split aggression factor at register 0x066B.
+//
+// tps43_read_raw's `if (number_of_fingers == 1)` then emits THAT cycle's RelX/RelY as
+// CURSOR motion, and two things make it land hard:
+//
+//   - RelX/RelY are only defined for a single finger. Datasheet 5.2.2: "If there is only
+//     one finger active, a Relative X and Relative Y value is available... Note: Gestures
+//     also use these registers to indicate swipe, scroll and zoom parameters." So the cycle
+//     where the finger count changes is exactly where those two registers change MEANING --
+//     whatever they hold there is not a cursor delta. When the chip re-picks which finger it
+//     tracks (5.2.6: fingers are tracked cycle-to-cycle by memory slot), the value is the
+//     distance BETWEEN the two fingers.
+//   - rules.mk sets MOUSE_EXTENDED_REPORT, so MOUSE_REPORT_XY_MAX is INT16_MAX and the
+//     CONSTRAIN_HID_XY in tps43_read_raw is a literal no-op. Nothing bounds the value.
+//
+// The host can also see one such jump MORE THAN ONCE: shared_mouse_report is never zeroed
+// after it is consumed (pointing_device.c:46 / :304) and read_if_checksum_mismatch re-delivers
+// the previous report whenever the checksum is unchanged (transactions.c:147-159). Bounding
+// the MAGNITUDE of the jump is therefore worth more than bounding how often it occurs.
+//
+// Two independent defences below. Both are deliberately free of any latch that clears only on
+// a full lift -- see the note on the guard being a timeout.
+
+// 1. JUMP REJECT (stateless). A real finger cannot move this fast. The TPS43 is 43 mm wide at
+// 2048 counts = 47.6 counts/mm, and a cycle is AZOTEQ_IQS5XX_REPORT_RATE = 10 ms, so 350
+// counts is 7.4 mm in one cycle = 735 mm/s -- that finger would cross the entire pad in 58 ms.
+// A tracked-finger re-assignment is the inter-finger distance instead: two fingers 15-25 mm
+// apart give 714-1190 counts. The two ranges do not overlap, so this separates them cleanly.
+// Applied to the CURSOR ONLY: the scroll path already bounds its backlog with
+// TPS43_SCROLL_CAP, so a wild raw value there costs a notch or two, never a teleport.
+// The clip runs BEFORE the accumulator, so a rejected cycle is dropped outright rather than
+// surviving as a remainder -- correct here, because the value was never real motion.
+// Set to 0 to disable.
+#ifndef TPS43_JUMP_REJECT
+#    define TPS43_JUMP_REJECT 350 // reject |cursor delta| > this many raw counts in one cycle
+#endif
+
+// 2. MULTI-TOUCH GUARD (one timestamp). After ANY cycle that saw >= 2 fingers, suppress cursor
+// motion for this long. That covers the dropout in both directions -- the 2->1 glitch in the
+// middle of a scroll, and the staggered lift at the end of one, where the second finger stays
+// down for a few more cycles and its motion would otherwise drive the pointer. It also fixes a
+// separate pre-existing bug for free: on a two-finger tap with a staggered lift, the chip's
+// two_finger_tap event (BUTTON2) and the 1-finger cursor path can both fire on the same cycle.
+//
+// Deliberately a TIMEOUT rather than "until every finger leaves the pad". A latch that only
+// clears on a full lift would freeze the cursor for the REST of the touch whenever a resting
+// palm registered as a second finger for a single cycle -- e.g. in the middle of a
+// button-held drag-select, which would lose the selection with no way out but to let go.
+// A timeout self-heals. Keep it comfortably longer than the dropouts being filtered (a few
+// 10 ms cycles) and shorter than a deliberate lift-and-repoint.
+#ifndef TPS43_MULTI_GUARD_MS
+#    define TPS43_MULTI_GUARD_MS 120 // ignore cursor motion for this long after any >=2 finger cycle
+#endif
+
 // ---- TWO-FINGER scroll: constant-RATE limiter (not a divisor) ----------------------
 // SCOPE: this shapes the chip's two-finger scroll gesture ONLY, whose job on this board is
 // small, precise scrolling. The Fn + one-finger gesture is a different feature for
@@ -514,6 +573,7 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
     static int16_t  acc_x = 0, acc_y = 0, acc_h = 0, acc_v = 0;
     static uint32_t scroll_notch_h = 0, scroll_notch_v = 0; // last-notch timestamps
     static uint32_t scroll_last_input = 0;                  // last cycle with scroll input
+    static uint32_t last_multi_ms = 0;                      // last cycle that saw >= 2 fingers
 
     // mouse_report is unused: the chip's report is absolute-per-cycle, and the driver it
     // replaced ignored the incoming buttons too (it built its report from {0}).
@@ -534,6 +594,27 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
     int16_t y = r.y;
     if (x <= TPS43_JITTER_DEADZONE && x >= -TPS43_JITTER_DEADZONE) x = 0;
     if (y <= TPS43_JITTER_DEADZONE && y >= -TPS43_JITTER_DEADZONE) y = 0;
+    // Defence 1: a delta no finger could have produced is a finger re-assignment, not motion.
+    // On a failed read r is zeroed, so this cannot fire on a NAK.
+#if TPS43_JUMP_REJECT > 0
+    if (x > TPS43_JUMP_REJECT || x < -TPS43_JUMP_REJECT || y > TPS43_JUMP_REJECT || y < -TPS43_JUMP_REJECT) {
+        x = 0;
+        y = 0;
+    }
+#endif
+    // Defence 2: near a multi-finger gesture, a 1-finger cycle is far more likely to be a
+    // dropout than a real single-finger move, so it must not steer the cursor. Note the
+    // timestamp is taken from THIS cycle before the test, so the very cycle that reports 2
+    // fingers is already covered. On a failed read fingers is 0 and neither branch applies.
+#if TPS43_MULTI_GUARD_MS > 0
+    if (fingers >= 2) {
+        last_multi_ms = timer_read32();
+    }
+    if (fingers == 1 && timer_elapsed32(last_multi_ms) <= TPS43_MULTI_GUARD_MS) {
+        x = 0;
+        y = 0;
+    }
+#endif
     r.x = tps43_scale(x, &acc_x, TPS43_CURSOR_DIVISOR);
     r.y = tps43_scale(y, &acc_y, TPS43_CURSOR_DIVISOR);
 
