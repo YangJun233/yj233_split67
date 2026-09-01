@@ -302,7 +302,7 @@ static inline void fn_scroll_stop(fn_axis_t *a) {
 // the page has to stop moving. Fn is excluded so releasing it does not cut the ride short,
 // which is the whole point of coasting after the finger is gone.
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
-    if (record->event.pressed && keycode != MO(FN_LAYER) && keycode != MO(2)) {
+    if (record->event.pressed && keycode != MO(FN_LAYER)) {
         fn_coast_kill = true;
     }
     return true;
@@ -451,10 +451,15 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
         KC_MS_BTN3, KC_ENT, _______, _______, KC_HOME, KC_PGDN, KC_END
     ),
 
-    // Layer 2: left-half Fn (MO(2), the key labelled Fn).
-    // Identical to layer 1 except the arrow cluster, which becomes media transport:
-    //   Left = prev track, Down = play/pause, Right = next track.
-    //   Up is left transparent, so it stays a plain Up arrow.
+    // Layer 2: reserved, unreachable as the keymap stands.
+    //
+    // It was documented as "left-half Fn (MO(2)), arrows become media transport -- Left =
+    // prev track, Down = play/pause, Right = next track". None of that was ever in this
+    // file: BOTH halves' Fn keys are MO(1) (see layer 0), MO(2) appeared in no keymap entry
+    // at all, and every key on this layer is transparent. The description is deleted rather
+    // than kept as an aspiration, so nobody trusts it again. Kept as a blank layer because
+    // DYNAMIC_KEYMAP_LAYER_COUNT is 4 and transparent is a better starting point than the
+    // KC_NO this would decay to if the entry were dropped from the array.
     [2] = LAYOUT(
         _______, _______, _______, _______, _______, _______,
         _______, _______, _______, _______, _______, _______,
