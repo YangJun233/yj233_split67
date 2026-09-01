@@ -395,32 +395,6 @@ report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
     }
 #endif // FN_COAST_ENABLE
 
-    // Three-finger gesture dispatch — disabled (not removed). The stock vial-qmk azoteq
-    // driver does not expose three-finger gestures (no AZOTEQ_IQS5XX_3F_* button-bit
-    // encoding), so this block is wrapped in #if 0. Switch to #if 1 to re-enable it
-    // once a custom driver that emits those bits is added back.
-#if 0
-    // The driver encodes gestures as button bits; intercept and clear them here,
-    // then perform whatever action you want. DOWN must be checked before LEFT/RIGHT
-    // because it uses both bits simultaneously.
-    if ((mouse_report.buttons & AZOTEQ_IQS5XX_3F_DOWN_BITS) == AZOTEQ_IQS5XX_3F_DOWN_BITS) {
-        mouse_report.buttons &= ~AZOTEQ_IQS5XX_3F_DOWN_BITS;
-        // ← three-finger swipe down: customize action here
-    } else if (mouse_report.buttons & AZOTEQ_IQS5XX_3F_UP_BIT) {
-        mouse_report.buttons &= ~AZOTEQ_IQS5XX_3F_UP_BIT;
-        // ← three-finger swipe up: customize action here
-    } else if (mouse_report.buttons & AZOTEQ_IQS5XX_3F_LEFT_BIT) {
-        mouse_report.buttons &= ~AZOTEQ_IQS5XX_3F_LEFT_BIT;
-        tap_code16(KC_BTN4);  // three-finger swipe left: browser back
-    } else if (mouse_report.buttons & AZOTEQ_IQS5XX_3F_RIGHT_BIT) {
-        mouse_report.buttons &= ~AZOTEQ_IQS5XX_3F_RIGHT_BIT;
-        tap_code16(KC_BTN5);  // three-finger swipe right: browser forward
-    } else if (mouse_report.buttons & AZOTEQ_IQS5XX_3F_TAP_BIT) {
-        mouse_report.buttons &= ~AZOTEQ_IQS5XX_3F_TAP_BIT;
-        tap_code16(KC_BTN3);  // three-finger tap: middle click
-    }
-#endif
-
     // Zoom removed: AZOTEQ_IQS5XX_ZOOM_ENABLE is false in config.h, so the chip no longer
     // emits the BTN7/BTN8 pinch-zoom bits. The old handler that turned them into Ctrl+/-
     // has been deleted — two-finger gestures now always scroll.
