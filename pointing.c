@@ -330,8 +330,21 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 // Resting tremble is still handled -- by the accumulate-and-divide in tps43_scale, which is a
 // zero-mean low-pass: oscillating noise (+1,-1,+1,...) sums back toward zero and emits nothing,
 // while sustained motion in one direction accumulates and gets through. That filter keeps the
-// information; the deadzone destroyed it. If tremble does return, prefer raising
-// TPS43_CURSOR_DIVISOR before setting this back to 1.
+// information; the deadzone destroyed it.
+//
+// The word doing the work there is ZERO-MEAN, and it is an assumption, not a measurement. If
+// the resting noise on an axis ever carries a DC bias -- more +1 cycles than -1 -- the
+// accumulator integrates the bias and the cursor creeps in one direction with the finger
+// sitting still. That is the same failure TP_DEADZONE still guards against on the TrackPoint
+// path in this very file, kept there because that module's residual IS biased. Nothing of the
+// sort has been seen on this pad, so nothing is spent defending against it; this note exists
+// so the mechanism is on record if it ever shows up.
+//
+// Which knob to reach for depends on WHICH symptom returns, and they are not the same:
+//   - symmetric tremble (jitters in place, no net travel): raise TPS43_CURSOR_DIVISOR.
+//   - one-directional creep (drifts steadily one way): a divisor does NOT fix it -- it scales
+//     the bias down but the accumulator still integrates it to the same place, just slower.
+//     Set this deadzone back to 1, and accept the cost documented above on slow movement.
 #ifndef TPS43_JITTER_DEADZONE
 #    define TPS43_JITTER_DEADZONE 0 // drop resting |cursor delta| <= this (0 disables)
 #endif
@@ -648,12 +661,27 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
         // End the stretch as soon as a NEW finger is on the pad, so the click hands over
         // cleanly to whatever comes next (a drag, or a second click).
         //
-        // This used to test the shaped deltas (x/y) instead, on the reasoning that the
-        // deadzone had already removed the resting noise floor. TPS43_JITTER_DEADZONE is 0
-        // now -- it was destroying slow movement -- so x/y carry the raw +/-1 tremble again
-        // and that test would fire on noise, cutting every click back to one cycle and
-        // re-opening the dropped-click problem CLICK_MIN_MS exists to fix. The finger count
-        // is the signal actually wanted here and it does not depend on any shaping stage.
+        // This used to test the shaped deltas (x/y). The stated reason for replacing that
+        // test was WRONG, and is corrected here rather than quietly dropped: it claimed that
+        // with TPS43_JITTER_DEADZONE at 0 the x/y arriving here "carry the raw +/-1 tremble"
+        // and so the test would fire on noise. They do not. r.x/r.y are assigned above from
+        // tps43_scale, and that accumulate-and-divide is a zero-mean low-pass -- a strictly
+        // alternating +1,-1 tremble sums back to 0 and emits NOTHING (the
+        // TPS43_JITTER_DEADZONE block above says exactly this). Only a run of same-signed
+        // noise cycles leaks a delta through, so the old test was far less trigger-happy
+        // than that reasoning assumed.
+        //
+        // The finger count is kept anyway, on its own merits: it is the signal actually
+        // wanted here ("a finger is down"), it does not depend on any shaping stage, and it
+        // hands over EARLIER than "a finger is down AND already moving" -- the safer side
+        // for the accidental drag this guard exists to prevent.
+        //
+        // Its cost, which the old comment hid: it truncates the stretch on ANY contact
+        // inside CLICK_MIN_MS -- the second press of a fast double-click, or a two-finger
+        // tap whose fingers leave unevenly -- so that click gets the time until the contact
+        // rather than the full 50 ms. Still comfortably above the ~10 ms beat this exists to
+        // clear, so it is not a live bug; but the full 50 ms is not actually guaranteed, and
+        // if a dropped click ever comes back this line is the first suspect.
         // On a failed read fingers is 0, so the stretch simply continues -- the safe way round.
         if (fingers >= 1) {
             held_buttons = 0;

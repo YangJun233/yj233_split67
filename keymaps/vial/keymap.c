@@ -144,10 +144,20 @@
 // the same time, which was part of overshooting into "太快". Two cycles it is. There is no
 // finger-count bit to consult on this side -- with POINTING_DEVICE_COMBINED only
 // x/y/h/v/buttons cross the split, and the touch count stays on whichever half owns the
-// pad. It does not need one: a finger resting ON the pad is never perfectly still (
-// pointing.c keeps the resting tremble on purpose, TPS43_JITTER_DEADZONE is 0), so
-// "stop moving but keep touching" is self-correcting -- the EMA has already decayed under
-// MIN by then, and any tremble cycle cancels a coast that did start.
+// pad. That absence is a real limitation, and this comment used to paper over it: it argued
+// that a finger resting ON the pad is never perfectly still, so the tremble keeps reaching
+// this hook and "stop moving but keep touching" is self-correcting. It is NOT, reliably.
+// pointing.c does keep the tremble at the sensor (TPS43_JITTER_DEADZONE is 0), but the
+// report passes through tps43_scale on the way here, and that accumulate-and-divide is a
+// zero-mean low-pass: a strictly alternating +1,-1 tremble sums back to 0 and emits NOTHING.
+// Only a run of same-signed cycles leaks a delta through. So "finger down but still" can
+// look exactly like "finger lifted" from this side of the split.
+//
+// What actually keeps that benign is the MIN gate, not the tremble: coming to a stop decays
+// the EMA under FN_COAST_MIN_MNPS, so a drag slowed to a halt launches nothing. The case
+// genuinely not covered is stopping ABRUPTLY at speed without lifting -- that does coast,
+// and from here it is indistinguishable from a flick-and-lift. Moving the finger again
+// cancels it on the next cycle (real motion, not tremble), as does any keypress.
 #define FN_COAST_ENABLE                  // comment out to get the old hard-stop scroll back
 #define FN_COAST_GAIN_NUM      1         // launch speed = lift speed * NUM/DEN ...
 #define FN_COAST_GAIN_DEN      1         // ... 1/1: hand the finger's own speed straight over
@@ -319,17 +329,24 @@ report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
         if (dt < 1) dt = 1;
         if (dt > 100) dt = 100; // first cycle or a long idle: never integrate a huge step
 
-        bool moved = (mouse_report.x != 0 || mouse_report.y != 0);
-        bool fn    = layer_state_is(FN_LAYER);
+        bool moved   = (mouse_report.x != 0 || mouse_report.y != 0);
+        bool fn      = layer_state_is(FN_LAYER);
+        bool killed  = fn_coast_kill; // latch it: the block below clears the flag
 
-        // Anything new ends the ride: a touch (even the resting tremble of a finger put
-        // back down), a two-finger scroll, a button, a keypress.
-        if (moved || mouse_report.h != 0 || mouse_report.v != 0 || mouse_report.buttons != 0 || fn_coast_kill) {
+        // Anything new ends the ride: a touch (a finger put back down and moved), a
+        // two-finger scroll, a button, a keypress.
+        if (moved || mouse_report.h != 0 || mouse_report.v != 0 || mouse_report.buttons != 0 || killed) {
             fn_scroll_stop(&ah);
             fn_scroll_stop(&av);
             fn_coast_kill = false;
-            if (!fn) {
-                dragging = false; // plain cursor use, not a flick waiting to be launched
+            // A keypress has to cancel the PENDING drag too, not just a coast already
+            // running. Without the `|| killed` this block would consume the kill flag while
+            // the coast has not launched yet -- during the FN_COAST_LIFT_MS window, when
+            // fn_scroll_stop() has nothing to stop -- and the launch test below would then
+            // fire anyway, one cycle after the user pressed a key to prevent exactly that.
+            // Fn is held throughout that window, so `!fn` alone never clears it.
+            if (!fn || killed) {
+                dragging = false; // plain cursor use, or a keypress: not a flick to launch
             }
         }
 
