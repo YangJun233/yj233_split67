@@ -408,6 +408,46 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 #    define TPS43_MULTI_GUARD_MS 120 // ignore cursor motion for this long after any >=2 finger cycle
 #endif
 
+// ---- Touch-down displacement gate (the "put a finger down and nothing moves" behaviour) ----
+// A laptop touchpad hands the OS ABSOLUTE contacts, so libinput/Precision Touchpad can hold a
+// reference point and emit nothing until the finger has travelled past a margin (~0.5 mm). We
+// hand the host a RELATIVE mouse: once a delta is sent it cannot be taken back. So the same
+// margin has to be applied here, before anything is sent.
+//
+// On every new touch (a 0 -> 1+ finger edge) the gate LOCKS: raw deltas are summed into a
+// private accumulator and NOTHING is emitted. It unlocks for the rest of the touch as soon as
+// the summed travel passes TPS43_TOUCH_GATE_DISTANCE on either axis, and the travel spent
+// getting there is DISCARDED, not replayed -- replaying it would make the pointer visibly jump
+// at the unlock instant, and on a relative pointer the lost fraction of a millimetre has no
+// reference frame to be noticed against (this is what libinput does when it re-centres).
+//
+// What it costs: the unlock is delayed by distance/speed, so a fast flick pays ~4 ms and an
+// extremely slow micro-adjustment pays ~35 ms at the default below. That cost is paid ONCE per
+// touch, at its start -- it is NOT the per-poll clip that TPS43_JITTER_DEADZONE is, which
+// destroys slow movement for the WHOLE touch. After unlock this stage is fully transparent.
+//
+// It also protects the click for free: during a tap the finger travels less than the gate, so
+// the whole touch emits zero motion, and the chip's own tap verdict (AZOTEQ_IQS5XX_TAP_DISTANCE
+// = 18 counts) is unaffected -- keep the gate BELOW that number, or a touch could unlock the
+// pointer while still qualifying as a tap, which is the "click also moved the cursor" case.
+//
+// Sizing: the TPS43 is 2048 counts / 43 mm => ~47.6 counts/mm (the Y axis is 1792 counts over a
+// proportionally shorter pad, so the same scale is assumed for both). The gate must exceed the
+// resting noise floor's ACCUMULATED excursion, which is not the same as its per-cycle
+// amplitude -- same-signed noise runs are what leak through tps43_scale. 8 counts (~0.17 mm) is
+// a deliberately small first try: big enough to swallow a few same-signed noise cycles, small
+// enough that the start-of-touch delay stays under ~35 ms even at a crawl. If resting tremble
+// survives it, raise it toward 12-16 (still under the 18-count tap distance) before reaching
+// for TPS43_JITTER_DEADZONE.
+//
+// NOTE this gate only arms at touch-down. A finger that stops MID-touch is already unlocked and
+// will tremble again; fixing that needs a full re-centring hysteresis (a reference point
+// maintained for the whole touch), which also introduces backlash on every direction reversal.
+// Not done here on purpose -- the reported symptom is tremble on finger-down.
+#ifndef TPS43_TOUCH_GATE_DISTANCE
+#    define TPS43_TOUCH_GATE_DISTANCE 8 // raw counts of travel before a new touch may move the cursor (0 disables)
+#endif
+
 // ---- TWO-FINGER scroll: constant-RATE limiter (not a divisor) ----------------------
 // SCOPE: this shapes the chip's two-finger scroll gesture ONLY, whose job on this board is
 // small, precise scrolling. The Fn + one-finger gesture is a different feature for
@@ -594,11 +634,14 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
 
     uint8_t        fingers = 0;
     report_mouse_t r       = {0};
-    // The return value distinguishes a failed read from a genuinely idle cycle. Nothing needs
-    // that distinction any more: a failed read zeroes both the report and the finger count, and
-    // the click stretch below treats fingers == 0 as "continue stretching", which is the safe
-    // direction for a NAK. Discarded explicitly so it does not read as an oversight.
-    (void)tps43_read_raw(&r, &fingers);
+    // The return value distinguishes a failed read from a genuinely idle cycle. The click
+    // stretch below does not need it (a failed read zeroes both the report and the finger
+    // count, and it treats fingers == 0 as "continue stretching", the safe direction for a
+    // NAK). The touch-down gate DOES: a NAK also looks like fingers == 0, and re-arming the
+    // gate on one would re-lock the cursor in the middle of a move and cost another
+    // TPS43_TOUCH_GATE_DISTANCE of travel -- a visible stutter. So gate state only advances on
+    // a cycle that actually carried data.
+    const bool read_ok = tps43_read_raw(&r, &fingers);
 
     // Cursor: deadzone the resting noise floor first (so it never enters the
     // accumulator), then slow + smooth. x/y are only non-zero during single-finger
@@ -628,6 +671,38 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
         y = 0;
     }
 #endif
+    // Defence 3: the touch-down displacement gate (see the tunable's comment block). Runs LAST
+    // of the three, so travel that the guards above already rejected cannot count toward
+    // unlocking it. It must also run BEFORE tps43_scale, so gated motion never reaches the
+    // cursor accumulator -- otherwise the discarded travel would be integrated and leak out on
+    // the first cycle after unlock, which is the pointer jump this design avoids.
+#if TPS43_TOUCH_GATE_DISTANCE > 0
+    static bool    gate_locked = true; // a touch is pending until proven to be a move
+    static int16_t gate_x = 0, gate_y = 0;
+    if (read_ok) {
+        if (fingers == 0) {
+            // Pad is clear: arm the gate for the next touch. Only trusted on a good read.
+            gate_locked = true;
+            gate_x      = 0;
+            gate_y      = 0;
+        } else if (gate_locked) {
+            gate_x += x;
+            gate_y += y;
+            // Chebyshev (per-axis) rather than Euclidean: no multiply or sqrt in the poll path,
+            // and the axis-aligned moves that dominate real use unlock at exactly the stated
+            // distance. A pure 45-degree move unlocks ~1.4x later, which is not worth a sqrt.
+            if (gate_x > TPS43_TOUCH_GATE_DISTANCE || gate_x < -TPS43_TOUCH_GATE_DISTANCE || gate_y > TPS43_TOUCH_GATE_DISTANCE || gate_y < -TPS43_TOUCH_GATE_DISTANCE) {
+                gate_locked = false; // stays unlocked for the rest of this touch
+            }
+        }
+    }
+    if (gate_locked) {
+        // Discarded, not replayed: see the tunable's comment block.
+        x = 0;
+        y = 0;
+    }
+#endif
+
     r.x = tps43_scale(x, &acc_x, TPS43_CURSOR_DIVISOR);
     r.y = tps43_scale(y, &acc_y, TPS43_CURSOR_DIVISOR);
 
