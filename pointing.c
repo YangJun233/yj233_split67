@@ -448,6 +448,41 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 #    define TPS43_TOUCH_GATE_DISTANCE 8 // raw counts of travel before a new touch may move the cursor (0 disables)
 #endif
 
+// ---- Lift-off hold (the other half of the contact-area problem) --------------------
+// TPS43_TOUCH_GATE_DISTANCE above covers finger-DOWN. Finger-UP is the same physics and the
+// worse symptom: as the finger lifts, the contact patch shrinks from the pad of the finger
+// toward the tip, and the centroid genuinely travels with it -- 0.5-2 mm is ordinary, which is
+// 24-95 raw counts, 12-48 px after TPS43_CURSOR_DIVISOR. The sensor is not wrong and the value
+// is not noise, so NO threshold can reject it: at the moment it arrives it is indistinguishable
+// from real slow movement, and only the lift that follows reveals what it was. It also unlocks
+// the touch-down gate near the end of a tap, which is why a click could still throw the pointer.
+//
+// A laptop touchpad solves this by being allowed to change its mind -- it holds contacts and
+// decides afterwards. We cannot: a delta handed to the host is gone. So buy the same right by
+// delaying the pointer. Cursor deltas go through a TPS43_LIFT_HOLD_CYCLES-deep shift register,
+// so what the host receives is always what the finger did that many cycles ago; when the finger
+// leaves (fingers -> 0) the whole register is DROPPED, and with it the entire release transient,
+// however large it was. That is the point of this design over a threshold: it is
+// magnitude-agnostic. It does not need to know how far the centroid moves on your finger.
+//
+// Costs, both real and both inherent to the trick:
+//   - Pointer latency of HOLD * AZOTEQ_IQS5XX_REPORT_RATE ms (3 * 10 = 30 ms at the default),
+//     on all cursor motion, always. This is a large part of why a touchpad feels different from
+//     a mouse. Do not raise HOLD casually.
+//   - Every stroke under-travels by whatever was still in the register when the finger left, up
+//     to HOLD cycles' worth. Lifting mid-flick loses more than lifting after stopping. It is
+//     consistent, so the hand adapts to it; a larger HOLD makes it less so.
+// Both scale with HOLD, and so does how much of the release transient gets caught. 3 cycles
+// (30 ms) is the starting compromise. If the pointer still slides at lift-off the transient is
+// longer than 30 ms -- raise to 4-5. If aiming feels laggy or strokes fall short, lower to 2.
+//
+// Scroll (r.h/r.v) deliberately does NOT go through this: it is already rate-limited to discrete
+// notches by tps43_scroll_rate, a stray notch at lift-off is far less costly than a misplaced
+// click, and delaying scroll by 30 ms would be felt immediately.
+#ifndef TPS43_LIFT_HOLD_CYCLES
+#    define TPS43_LIFT_HOLD_CYCLES 3 // poll cycles of cursor delay, dropped on finger lift (0 disables)
+#endif
+
 // ---- TWO-FINGER scroll: constant-RATE limiter (not a divisor) ----------------------
 // SCOPE: this shapes the chip's two-finger scroll gesture ONLY, whose job on this board is
 // small, precise scrolling. The Fn + one-finger gesture is a different feature for
@@ -700,6 +735,40 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
         // Discarded, not replayed: see the tunable's comment block.
         x = 0;
         y = 0;
+    }
+#endif
+
+    // Defence 4: the lift-off hold (see the tunable's comment block). Must run AFTER the
+    // touch-down gate -- motion the gate suppressed is already zero and should occupy a slot
+    // like any other cycle, so the delay stays a fixed number of cycles -- and BEFORE
+    // tps43_scale, so travel that will be dropped at lift never reaches the cursor accumulator.
+#if TPS43_LIFT_HOLD_CYCLES > 0
+    static int16_t hold_x[TPS43_LIFT_HOLD_CYCLES] = {0};
+    static int16_t hold_y[TPS43_LIFT_HOLD_CYCLES] = {0};
+    if (!read_ok) {
+        // No data this cycle. Emitting the tail would advance the delay against a cycle that
+        // never happened, so hold everything where it is and send nothing.
+        x = 0;
+        y = 0;
+    } else if (fingers == 0) {
+        // Finger gone: discard the pending travel. This is the release transient.
+        for (uint8_t i = 0; i < TPS43_LIFT_HOLD_CYCLES; i++) {
+            hold_x[i] = 0;
+            hold_y[i] = 0;
+        }
+        x = 0;
+        y = 0;
+    } else {
+        const int16_t out_x = hold_x[TPS43_LIFT_HOLD_CYCLES - 1];
+        const int16_t out_y = hold_y[TPS43_LIFT_HOLD_CYCLES - 1];
+        for (uint8_t i = TPS43_LIFT_HOLD_CYCLES - 1; i > 0; i--) {
+            hold_x[i] = hold_x[i - 1];
+            hold_y[i] = hold_y[i - 1];
+        }
+        hold_x[0] = x;
+        hold_y[0] = y;
+        x         = out_x;
+        y         = out_y;
     }
 #endif
 
