@@ -14,3 +14,6 @@ SRC += pointing.c
 # the data goes through split forwarding instead of ps2_mouse's direct HID send).
 PS2_ENABLE = yes
 PS2_DRIVER = vendor
+
+# KEY_FADE per-key fade effect (rgb_matrix_kb.inc)
+RGB_MATRIX_CUSTOM_KB = yes

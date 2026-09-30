@@ -143,16 +143,36 @@ void keyboard_pre_init_kb(void) {
 }
 
 #ifdef RGB_MATRIX_ENABLE
-// Cut the WS2812 rail when the matrix is off.
+// Cut the WS2812 rail when the matrix is off, the host is suspended, or the
+// effect has been showing nothing at all for a moment.
 //
 // RGB_TOG only zeroes the effect: rgb_matrix_task() keeps rendering and
 // flushing all-black frames (quantum/rgb_matrix/rgb_matrix.c, `effect = ... ? 0
 // : mode`), so the LEDs stay powered and keep drawing their quiescent current.
 // Gate RGB_EN_PIN on the enable/suspend state to actually remove that draw.
 //
-// Runs on both halves: rgb_matrix_config and the suspend flag are mirrored to
-// the slave by the split RGB_MATRIX transaction, so each half gates its own rail.
+// Runs on both halves: rgb_matrix_config and (with rgb_matrix.sleep in
+// info.json, i.e. RGB_MATRIX_SLEEP) the matrix suspend flag are mirrored to the
+// slave by the split RGB_MATRIX transaction, so each half gates its own rail.
+// Without RGB_MATRIX_SLEEP rgb_matrix_set_suspend_state() is a no-op and the
+// flag reads false forever -- that is why info.json enables it.
 static bool rgb_powered = true; // keyboard_pre_init_kb() left the rail on
+
+// Master only: set by the USB suspend hooks below. The matrix suspend flag is
+// set by quantum.c only AFTER suspend_power_down_kb() and an rgb_matrix_task()
+// pass (suspend_power_down_quantum), so on its own it leaves a window where a
+// lit frame's indicator hook would switch the rail back on.
+static bool rgb_usb_suspended = false;
+
+// Last time a rendered frame had any led lit on this half (see
+// rgb_matrix_indicators_kb). The rail is cut once frames have stayed black for
+// RGB_RAIL_OFF_DELAY_MS -- e.g. KEY_FADE with no key inside its fade window.
+// Effect-agnostic on purpose: it reads the actual frame rather than knowing
+// which effect is on. The delay stops effects that only touch black for an
+// instant (breathing at the bottom of its cycle) from toggling the rail -- and
+// paying a power-up inrush plus the 2 ms stall -- on every cycle.
+#define RGB_RAIL_OFF_DELAY_MS 200
+static uint32_t rgb_last_lit = 0;
 
 static void rgb_power_set(bool on) {
     if (on == rgb_powered) return;
@@ -168,7 +188,98 @@ static void rgb_power_set(bool on) {
 }
 
 static void rgb_power_task(void) {
-    rgb_power_set(rgb_matrix_is_enabled() && !rgb_matrix_get_suspend_state());
+    bool dark = timer_elapsed32(rgb_last_lit) >= RGB_RAIL_OFF_DELAY_MS;
+    rgb_power_set(rgb_matrix_is_enabled() && !rgb_matrix_get_suspend_state() && !rgb_usb_suspended && !dark);
+}
+
+// ---- KEY_FADE press timestamps (effect in rgb_matrix_kb.inc) ----
+//
+// sync_timer time of each led's latest press. Only this half's entries are
+// ever rendered; on the master the other half's presses land here too and are
+// simply never read.
+uint32_t key_fade_start[RGB_MATRIX_LED_COUNT];
+
+// Press hook. rgb_matrix_handle_key_event() (quantum/rgb_matrix/rgb_matrix.c)
+// calls rgb_matrix_map_row_column_to_led() -> this _kb hook for every key PRESS
+// (RGB_MATRIX_KEYPRESSES, config.h), from switch_events() on BOTH halves
+// (RGB_MATRIX_SPLIT) -- so each half sees its own keys from its own scan and no
+// SPLIT_TRANSPORT_MIRROR is needed. It is the only per-press hook that runs on
+// the slave too (process_record_* are master only). Its real job, adding extra
+// leds for a key, is unused here: returning 0 keeps the stock one-led mapping.
+// Runs whatever effect is active; the timestamps are only read by KEY_FADE.
+uint8_t rgb_matrix_map_row_column_to_led_kb(uint8_t row, uint8_t column, uint8_t *led_i) {
+    uint8_t led = g_led_config.matrix_co[row][column];
+    if (led != NO_LED) {
+        key_fade_start[led] = sync_timer_read32();
+    }
+    return 0;
+}
+
+// ---- Per-half current limiter + lit-frame detection ----
+//
+// Hook point: rgb_matrix_task() calls rgb_matrix_indicators() once per frame,
+// right after the effect finished rendering the whole frame and before the
+// FLUSHING state sends it (quantum/rgb_matrix/rgb_matrix.c, RENDERING case). So
+// the buffer read here is the complete frame that is about to go out, and
+// anything changed here is what the leds get. It is only called while an effect
+// is running (effect != 0); the off / suspended cases are handled by
+// rgb_power_task() from housekeeping and the suspend hooks.
+//
+// The values read are final PWM values: rgb_matrix's hsv_to_rgb has already
+// applied the CIE1931 curve (forced on with RGB_MATRIX_ENABLE, quantum/color.c),
+// so this is what actually sets the led current.
+//
+// The buffer is the RP2040 vendor driver's ws2812_leds[] (ws2812_vendor.c). It
+// has no header declaration, hence the extern; a different WS2812 driver without
+// that symbol fails at link time rather than silently skipping the limiter.
+//
+// Assumes every effect rewrites every led every frame (true for all effects built
+// here). An effect that drew once and relied on the buffer persisting would be
+// scaled again every frame and fade out.
+extern ws2812_led_t ws2812_leds[WS2812_LED_COUNT];
+
+// Budget in "sum of r+g+b" units: one channel at 255 ~= WS2812_CHANNEL_FULL_MA.
+#define RGB_CURRENT_BUDGET_UNITS ((uint32_t)RGB_CURRENT_BUDGET_MA * 255 / WS2812_CHANNEL_FULL_MA)
+
+bool rgb_matrix_indicators_kb(void) {
+    // The limiter is a safety cap, so it runs even if the user hook asks to skip
+    // keyboard-level indicators; its return value is passed through untouched.
+    bool res = rgb_matrix_indicators_user();
+
+    // This half's leds occupy the driver buffer from local index 0
+    // (rgb_matrix_led_index() rebases the right half). Entries past them are
+    // never on this chain, so they are not counted.
+#    ifdef RGB_MATRIX_SPLIT
+    const uint8_t split[2] = RGB_MATRIX_SPLIT;
+    const uint8_t count    = is_keyboard_left() ? split[0] : split[1];
+#    else
+    const uint8_t count = RGB_MATRIX_LED_COUNT;
+#    endif
+
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        sum += ws2812_leds[i].r + ws2812_leds[i].g + ws2812_leds[i].b;
+    }
+
+    if (sum > RGB_CURRENT_BUDGET_UNITS) {
+        // Same factor for every led keeps the hues; rounding down keeps the
+        // result at or under the budget.
+        for (uint8_t i = 0; i < count; i++) {
+            ws2812_leds[i].r = (uint32_t)ws2812_leds[i].r * RGB_CURRENT_BUDGET_UNITS / sum;
+            ws2812_leds[i].g = (uint32_t)ws2812_leds[i].g * RGB_CURRENT_BUDGET_UNITS / sum;
+            ws2812_leds[i].b = (uint32_t)ws2812_leds[i].b * RGB_CURRENT_BUDGET_UNITS / sum;
+        }
+    }
+
+    // Power the rail up HERE, before this frame is flushed, rather than waiting
+    // for housekeeping: otherwise the first lit frame after a key press would be
+    // sent into an unpowered chain and lost, adding a whole frame of latency.
+    if (sum != 0) {
+        rgb_last_lit = timer_read32();
+    }
+    rgb_power_task();
+
+    return res;
 }
 #endif
 
@@ -246,9 +357,11 @@ void housekeeping_task_kb(void) {
 // hooks instead of from the poll.
 void suspend_power_down_kb(void) {
 #ifdef RGB_MATRIX_ENABLE
-    // Forced, not rgb_power_task(): quantum.c calls this hook before it sets
-    // the matrix suspend flag, so the poll would still compute "keep it on".
-    rgb_power_set(false);
+    // quantum.c calls this hook before it sets the matrix suspend flag, and then
+    // runs rgb_matrix_task() in the same pass -- whose indicator hook would turn
+    // a lit frame's rail back on. The local flag closes that window.
+    rgb_usb_suspended = true;
+    rgb_power_task();
 #endif
 
     suspend_power_down_user();
@@ -256,8 +369,10 @@ void suspend_power_down_kb(void) {
 
 void suspend_wakeup_init_kb(void) {
 #ifdef RGB_MATRIX_ENABLE
-    // Here the flag is already cleared, so the poll gives the right answer and
-    // honours RGB_TOG — no flash of light on wake if the user had it off.
+    // Here the matrix flag is already cleared, so the poll gives the right
+    // answer and honours RGB_TOG — no flash of light on wake if the user had it
+    // off. A lit effect then gets its rail back from its first frame.
+    rgb_usb_suspended = false;
     rgb_power_task();
 #endif
 

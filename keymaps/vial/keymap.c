@@ -439,7 +439,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 
     // Layer 1: Fn (right half's MO(1))
     // Esc/1-5 = ` / F1-F5
-    // RGB: Tab=toggle  W/S=brightness+/-  E/D=hue+/-  R/F=sat+/-  T/G=mode/reverse
+    // RGB: Q=toggle  W/S=brightness+/-  E/D=hue+/-  R/F=sat+/-  T/G=mode/reverse
     // Fn + Space = Enter, Fn + Bksp = Insert
     // Fn + V (left) or Fn + M (right) = Win+Tab (Task View)
     // Fn + either thumb mouse-button key (left BTN1 / right BTN2 position) = middle click

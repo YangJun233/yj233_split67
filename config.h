@@ -180,9 +180,42 @@
 // resolution at 2048x1792 (see the orientation block above). POINTING_DEVICE_DEFAULT_CPI
 // is intentionally unused: QMK never reads it (nothing in quantum/ or drivers/ references it).
 
-// RGB matrix brightness cap (25/255 ≈ 10%, keeps total current well under 500mA)
-// lives in info.json as rgb_matrix.max_brightness / rgb_matrix.default.val —
-// redefining it here only produces "config.h is overwriting info.json" warnings.
+// RGB matrix brightness cap lives in info.json as rgb_matrix.max_brightness /
+// rgb_matrix.default.val — redefining it here only produces "config.h is
+// overwriting info.json" warnings.
+//
+// rgb_matrix val is NOT a PWM duty: hsv_to_rgb maps it through the CIE1931
+// lightness curve (CIE1931_CURVE, forced on with RGB_MATRIX_ENABLE, quantum/color.c,
+// quantum/led_tables.c). The old cap of 25 was PWM 3/255 — ~1% duty and only 3
+// real brightness steps for a fade to walk down.
+//
+// The cap is 145 = PWM 64/255. A 1 s KEY_FADE spans ~62 frames of
+// RGB_MATRIX_LED_FLUSH_LIMIT (16 ms), so ~64 distinct PWM levels is about one new
+// level per frame; more would mostly be skipped by the frame rate. The dim end
+// stays coarse no matter what (PWM 1 covers val 1..9) — that is the curve, not a
+// bug. 145 on every led of a half would draw ~0.5 A, so the cap is NOT what keeps
+// current in check any more — the per-half limiter below is. The cap only bounds
+// what Fn+W / Vial's slider can reach; the actual val is whatever you set there.
+
+// ---- Per-half LED current limiter (yj233_split67.c, rgb_matrix_indicators_kb) ----
+// After each frame is rendered and before it is sent, the half sums r+g+b over its
+// own leds, converts that to mA and, if it exceeds the budget, scales every led on
+// that half down by the same factor. Applies to every effect, so full-board
+// effects (solid colour, cycles) get dimmed automatically while a few KEY_FADE
+// keys still run at full peak.
+// WS2812_CHANNEL_FULL_MA is the datasheet-typical current of ONE colour channel at
+// 255 — an estimate, not measured on this board's leds. The quiescent draw of the
+// leds (~0.5-1 mA each even when black) is NOT included in the budget.
+#define RGB_CURRENT_BUDGET_MA 150 // per half
+#define WS2812_CHANNEL_FULL_MA 20
+
+// ---- KEY_FADE effect (rgb_matrix_kb.inc) ----
+// Makes rgb_matrix look up the led of every pressed key, which is where KEY_FADE
+// timestamps it. The built-in reactive animations switch this on implicitly
+// (rgb_matrix/post_config.h); a custom effect has to ask for it.
+#define RGB_MATRIX_KEYPRESSES
+// Fade time of one key, ms. Fixed on purpose — rgb_matrix speed is not used.
+#define KEY_FADE_MS 1000
 
 
 // RP2040 bootloader: double-tap the RESET button to enter UF2 mode
