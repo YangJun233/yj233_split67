@@ -35,6 +35,7 @@
 // ============================================================================
 
 #include "bootmagic.h" // BOOTMAGIC_ROW / BOOTMAGIC_COLUMN
+#include "usb_device_state.h"
 
 #if !defined(BOOTMAGIC_ENABLE)
 #    error "yj233_split67: the expansion kill switch samples the boot matrix from bootmagic_should_reset(), which only runs when BOOTMAGIC_ENABLE is on. Turning bootmagic off would silently delete the feature (dead code), so it is a hard error instead."
@@ -171,10 +172,69 @@ static void rgb_power_task(void) {
 }
 #endif
 
+// ============================================================================
+// Stuck modifier after plug-in: resync the host once USB is up
+//
+// Symptom: right after plugging in, Alt is held on the host -- every key comes out as
+// Alt+key -- until Alt is pressed and released once. Pressing it clears it, so the key
+// and the matrix are fine; what is stuck is a PRESS that reached some state (the host's,
+// or QMK's own) without its matching RELEASE. Where that press comes from is not yet
+// established -- candidates are a boot-time transient on the matrix, the split handshake,
+// a report sent while USB was half-enumerated, or a Vial combo/macro emitting Alt.
+//
+// The standard cure, independent of the cause: once the host has configured the
+// device and had a moment to settle, and nothing is physically held, send one
+// all-released report (clear_keyboard also clears QMK's own mods/keys, so a phantom
+// on the firmware side is cleared too). It re-runs on every re-enumeration -- plug-in,
+// host reboot, KVM switch -- since each is a new chance for the same desync.
+//
+// NOT a fix for the root cause, and it cannot help if the phantom press arrives later
+// than RESYNC_DELAY_MS, or comes from the host side (RDP, a VM, another keyboard).
+// USB_WAIT_FOR_ENUMERATION is not an option instead: with SPLIT_USB_DETECT the slave
+// half never enumerates and would hang in that wait.
+// ============================================================================
+#ifndef YJ_USB_RESYNC_DELAY_MS
+#    define YJ_USB_RESYNC_DELAY_MS 500
+#endif
+
+static bool yj_any_key_held(void) {
+    for (uint8_t row = 0; row < MATRIX_ROWS; row++) {
+        if (matrix_get_row(row)) return true;
+    }
+    return false;
+}
+
+static void yj_usb_resync_task(void) {
+    static bool     was_configured = false;
+    static bool     pending        = false;
+    static uint32_t configured_ms  = 0;
+
+    if (!is_keyboard_master()) return;
+
+    // Polled here rather than from notify_usb_device_state_change_kb(), which runs from
+    // the USB event callback -- not a place to be sending reports from.
+    const bool configured = usb_device_state_get_configure_state() == USB_DEVICE_STATE_CONFIGURED;
+    if (configured && !was_configured) {
+        pending       = true;
+        configured_ms = timer_read32();
+    }
+    was_configured = configured;
+
+    if (pending && configured && timer_elapsed32(configured_ms) >= YJ_USB_RESYNC_DELAY_MS) {
+        // A key held right now is genuine: leave it alone and do not retry, so this can
+        // never release something the user is actually pressing.
+        pending = false;
+        if (!yj_any_key_held()) {
+            clear_keyboard();
+        }
+    }
+}
+
 void housekeeping_task_kb(void) {
 #ifdef RGB_MATRIX_ENABLE
     rgb_power_task();
 #endif
+    yj_usb_resync_task();
 
     housekeeping_task_user();
 }

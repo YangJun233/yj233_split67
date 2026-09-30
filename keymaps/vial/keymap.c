@@ -54,6 +54,11 @@
 // type. Currently set for the touchpad; flip to -1 if you swap the TrackPoint back in.
 #define FN_SCROLL_Y_SIGN  1
 
+// X direction of the Fn+move scroll. Must match pointing.c's TPS43_SCROLL_H_SIGN (the
+// two-finger horizontal scroll), for the same reason as FN_SCROLL_Y_SIGN above: pushing the
+// same way must not scroll opposite ways. -1 = finger right -> scroll left.
+#define FN_SCROLL_X_SIGN  -1
+
 // ---- Fn 滚动惯性 (inertial / momentum scroll) --------------------------------------
 // Flick and lift: the wheel keeps turning after the finger leaves the pad and decays
 // smoothly to a stop instead of cutting off dead. Shape:
@@ -352,7 +357,7 @@ report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
 
         int16_t dh = 0, dv = 0;
         if (fn && moved) {
-            dh       = fn_scroll_drag(&ah, mouse_report.x, &move_h_ms, now);
+            dh       = fn_scroll_drag(&ah, (int16_t)(FN_SCROLL_X_SIGN * mouse_report.x), &move_h_ms, now);
             dv       = fn_scroll_drag(&av, (int16_t)(FN_SCROLL_Y_SIGN * mouse_report.y), &move_v_ms, now);
             touch_ms = now;
             dragging = true;
@@ -368,7 +373,7 @@ report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
             dv = fn_scroll_coast(&av, dt);
         }
 
-        mouse_report.h += dh; // move right -> scroll right (already matches two-finger)
+        mouse_report.h += dh; // sign already applied per FN_SCROLL_X_SIGN above
         mouse_report.v += dv; // sign already applied per FN_SCROLL_Y_SIGN above
         if (fn) {
             mouse_report.x = 0;
@@ -387,7 +392,7 @@ report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
         int16_t dv = scroll_ay / FN_SCROLL_DIVISOR;
         scroll_ax -= dh * FN_SCROLL_DIVISOR;
         scroll_ay -= dv * FN_SCROLL_DIVISOR;
-        mouse_report.h += dh;                               // move/push right -> scroll right (already matches two-finger)
+        mouse_report.h += (int16_t)(FN_SCROLL_X_SIGN * dh); // sign per FN_SCROLL_X_SIGN above
         mouse_report.v += (int16_t)(FN_SCROLL_Y_SIGN * dv); // sign per FN_SCROLL_Y_SIGN above
         mouse_report.x = 0;
         mouse_report.y = 0;
@@ -404,9 +409,10 @@ report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
     // The Fn one-finger scroll above is a separate gesture with its own tuning; see the
     // block at the top of this file.
 
-    // Tap-to-drag ("选中锁定") removed: a tap then move no longer latches BUTTON1, so the
-    // touchpad won't start an unintended selection/drag. Plain taps and physical mouse
-    // buttons are unaffected.
+    // The old tap-to-drag ("选中锁定": a tap then MOVE latched BUTTON1) stays removed -- it
+    // started unintended selections. Its replacement is tap-and-a-half (tap, touch down
+    // again and hold), which lives in pointing.c (TPS43_TAP_DRAG_*) because it needs the
+    // finger count, and that never crosses the split.
 
     return mouse_report;
 }

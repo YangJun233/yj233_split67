@@ -319,6 +319,54 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 #ifndef TPS43_CURSOR_DIVISOR
 #    define TPS43_CURSOR_DIVISOR 2 // cursor speed = raw / N  (bigger = slower; 1 = full speed)
 #endif
+
+// ---- Pointer acceleration: a laptop-style smooth curve, no steps -------------------------
+// A fixed divisor means one pad width always moves the pointer the same distance (2048/2 =
+// 1024 counts), so crossing a big screen takes several strokes. A laptop pad instead scales
+// by finger SPEED: slow = precise, fast = far. The gain here is a function of speed:
+//
+//   gain(v) = MIN                                   for v <= LO
+//           = MIN + (MAX - MIN) * smoothstep(t)     for LO < v < HI,  t = (v-LO)/(HI-LO)
+//           = MAX                                   for v >= HI
+//
+// smoothstep (3t^2 - 2t^3) is used rather than a straight ramp because a straight ramp still
+// has two corners, where the gain's rate of change jumps. smoothstep leaves the flat parts with
+// zero slope at both ends, so there is no speed at which the response changes character --
+// what "跟手 / no visible speed change" asks for. The pointer's travel per cycle is
+// delta * gain(v), which only ever grows with speed, so faster always means further.
+//
+// v is NOT the raw per-cycle delta: at slow speeds that is 0/1/2 counts of quantisation, and a
+// gain driven by it would flicker. It is an EMA over ~4 cycles (TPS43_ACCEL_EMA_SHIFT), and it
+// restarts from 0 on every new touch, so a stroke never inherits the previous stroke's speed.
+// Below LO the curve is flat at MIN = 1/TPS43_CURSOR_DIVISOR, so slow and resting behaviour --
+// precision, the zero-mean tremble filter -- is exactly what it was without acceleration.
+//
+// Units: speed in raw counts per 10 ms cycle. The pad is ~47.6 counts/mm, so 1 count/cycle =
+// 2.1 mm/s. Defaults: LO 10 (21 mm/s, a careful move), HI 60 (126 mm/s, a quick swipe),
+// MAX 1.5x raw = 3x the slow gain. One fast full-width swipe then moves 3072 counts.
+// Tuning: far moves still need two strokes -> raise MAX; fast moves overshoot -> lower MAX or
+// raise HI; medium moves feel sluggish -> lower LO. Gains are in 1/256 (256 = 1.0x raw).
+//
+// Note keymap.c's Fn one-finger scroll is built from this cursor delta, so a fast Fn drag
+// scrolls further too (as a long-distance scroll should); slow Fn scrolling is unchanged.
+#ifndef TPS43_ACCEL_ENABLE
+#    define TPS43_ACCEL_ENABLE 1 // 0 = plain 1/TPS43_CURSOR_DIVISOR, as before
+#endif
+#ifndef TPS43_ACCEL_GAIN_MIN
+#    define TPS43_ACCEL_GAIN_MIN (256 / TPS43_CURSOR_DIVISOR) // slow gain, 1/256 units (128 = 0.5x)
+#endif
+#ifndef TPS43_ACCEL_GAIN_MAX
+#    define TPS43_ACCEL_GAIN_MAX 384 // fast gain, 1/256 units (384 = 1.5x raw)
+#endif
+#ifndef TPS43_ACCEL_SPEED_LO
+#    define TPS43_ACCEL_SPEED_LO 10 // counts/cycle where the gain starts to rise
+#endif
+#ifndef TPS43_ACCEL_SPEED_HI
+#    define TPS43_ACCEL_SPEED_HI 60 // counts/cycle where it reaches GAIN_MAX
+#endif
+#ifndef TPS43_ACCEL_EMA_SHIFT
+#    define TPS43_ACCEL_EMA_SHIFT 2 // speed EMA weight 1/(1<<N); 2 = quarter, ~30-40 ms memory
+#endif
 // Resting-jitter deadzone. NOW OFF BY DEFAULT, and it must stay off unless resting tremble
 // actually comes back. The clip runs BEFORE the accumulator, so whatever it zeroes is gone for
 // good -- it does not survive as a remainder. During slow movement the chip's per-cycle delta IS
@@ -519,6 +567,14 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 // so the whole curve is exactly 2x the previous speed (top speed 7.4 -> 14.7 notch/s, and
 // scroll-per-millimetre doubled as well). To change speed again, keep multiplying BOTH by the
 // same factor -- and re-check the IDLE_RESET_MS > INTERVAL_MS ordering noted below.
+// Horizontal two-finger scroll direction. +1 feeds the chip's X delta straight through
+// (finger right -> scroll right); -1 reverses it (finger right -> content follows the finger,
+// i.e. scroll left). Only h: the vertical direction is set by the same Y delta the cursor
+// uses and is not touched. keymap.c's FN_SCROLL_X_SIGN must match this, or the two
+// horizontal scrolls go opposite ways.
+#ifndef TPS43_SCROLL_H_SIGN
+#    define TPS43_SCROLL_H_SIGN -1
+#endif
 #ifndef TPS43_SCROLL_STEP
 #    define TPS43_SCROLL_STEP 6 // raw units per notch (onset ~STEP/47.6 mm; bigger = less sensitive/slower)
 #endif
@@ -572,6 +628,105 @@ static report_mouse_t trackpoint_get_report(report_mouse_t mouse_report) {
 #ifndef TPS43_CLICK_MIN_MS
 #    define TPS43_CLICK_MIN_MS 50 // minimum click duration in ms (0 disables the stretch)
 #endif
+#ifndef TPS43_CLICK_CUT_MIN_MS
+#    define TPS43_CLICK_CUT_MIN_MS 20 // a new touch may cut the stretch, but not below this
+#endif
+
+// ---- Tap-and-a-half drag (双击后不松手拖动), and a double click that waits for the lift ----
+// Tap, then put the finger back down within TPS43_TAP_DRAG_WINDOW_MS and keep it there:
+// that is a drag, BUTTON1 held until the finger leaves. Tap twice, lifting both times: that
+// is a double click. Tap once: a click.
+//
+// The two gestures look identical until the second touch ends, so no button may go out for
+// the second touch before it does. The first version pressed BUTTON1 at the second
+// touch-down, and the host counts a double click on the second PRESS -- so every drag
+// started life as a double click (opening the file in Explorer, word-selecting in text).
+//
+// So this follows libinput's tap state machine: a tap presses BUTTON1 at once but does NOT
+// release it; the release waits for the window to run out.
+//   - no touch within the window  -> release: a single click;
+//   - a touch that ends as a tap  -> release, then a second press + release, both AFTER that
+//                                    lift: a double click, reported only once the finger
+//                                    is off the pad;
+//   - a touch that does anything else (moves, or stays past the tap time) -> the first
+//                                    tap's press is simply still down, so it is a drag,
+//                                    and the host saw ONE press -- never a double click.
+//
+// Cost: a single click's RELEASE is delayed by the window. The press is immediate, so
+// anything that reacts on press (focus, caret, selection) is not slower; things that fire on
+// release (buttons, links) are, by up to WINDOW_MS. Lower the window if clicks feel laggy,
+// raise it if a drag or a double click is hard to get in time. 0 disables all of this and
+// taps become plain stretched clicks again.
+//
+// It lives here, not in keymap.c, because it needs the finger count, and with
+// POINTING_DEVICE_COMBINED only x/y/h/v/buttons cross the split. (The old "tap then MOVE
+// latches BUTTON1" removed from keymap.c before git was a different, accident-prone rule.)
+#ifndef TPS43_TAP_DRAG_WINDOW_MS
+#    define TPS43_TAP_DRAG_WINDOW_MS 200 // ms after a tap in which a touch-down makes a drag / double click (0 disables)
+#endif
+// Released time between the two presses of a double click. Also counted as at least two
+// released reports, because one ~10 ms report is exactly what the split samplers described
+// above the click stretch can step over, and then the host would see one long press.
+#ifndef TPS43_TAP_DRAG_GAP_MS
+#    define TPS43_TAP_DRAG_GAP_MS 30
+#endif
+// How long the synthesised second click of a double click is held.
+#ifndef TPS43_TAP_DRAG_CLICK_MS
+#    define TPS43_TAP_DRAG_CLICK_MS 50
+#endif
+// A touch-down this soon after a tap is the finger bouncing off the pad, not a second tap:
+// it can extend the click into a drag if it stays, but a tap verdict on it is ignored, so
+// one bouncy tap never becomes a double click.
+#ifndef TPS43_TAP_DRAG_BOUNCE_MS
+#    define TPS43_TAP_DRAG_BOUNCE_MS 30
+#endif
+// Consecutive failed reads during a drag after which the button is released anyway, so a
+// pad that stops answering cannot leave BUTTON1 held on the host.
+#ifndef TPS43_TAP_DRAG_NAK_RELEASE
+#    define TPS43_TAP_DRAG_NAK_RELEASE 10
+#endif
+
+// ---- Soft tap: a click for the touches the chip's tap detector throws away -----------
+// "单击偶尔没反应". The chip reports single_tap for exactly one cycle, and only if the whole
+// touch stayed within AZOTEQ_IQS5XX_TAP_DISTANCE (18 counts = 0.38 mm) of where it landed
+// (datasheet 6.1). A touch it rejects produces nothing at all. Two ways a real tap gets
+// rejected, both already documented in this file:
+//   - the contact patch shrinks on lift and the centroid travels with it, 24-95 counts
+//     (see the lift-off hold) -- far more than 18, and it happens in the last cycles of
+//     EVERY tap, so how far it goes decides whether the chip counts the tap;
+//   - the one cycle that carries the event is lost (a failed read on that cycle).
+// Raising the chip's tap distance to cover the first would also turn every short cursor
+// nudge of up to that size into a click, because the chip cannot tell WHEN the travel
+// happened. We can: the lift-off hold already drops the last TPS43_LIFT_HOLD_CYCLES of
+// motion, so a touch whose travel all happened in those cycles never moved the pointer.
+//
+// So the rule is: a touch that the host saw NO pointer motion from, that was one finger
+// only, never engaged scroll, lasted no longer than the chip's own tap time, and whose raw
+// travel stayed inside TPS43_SOFT_TAP_MAX_TRAVEL, is a click -- if the chip did not already
+// report one. "It didn't move the pointer and it was quick" is what a tap is to the user.
+//
+// What it cannot rescue: a touch longer than the tap time (raise AZOTEQ_IQS5XX_TAP_TIME
+// instead -- the soft tap follows it), and a touch too light for the chip to see at all.
+// Set TPS43_SOFT_TAP_ENABLE to 0 to go back to chip taps only.
+#ifndef TPS43_SOFT_TAP_ENABLE
+#    define TPS43_SOFT_TAP_ENABLE 1
+#endif
+#ifndef TPS43_SOFT_TAP_MAX_MS
+#    define TPS43_SOFT_TAP_MAX_MS AZOTEQ_IQS5XX_TAP_TIME // same duration limit as the chip's tap
+#endif
+// Upper bound on the raw travel of a soft tap, per axis, including the part the lift-off
+// hold dropped. 96 counts = 2 mm covers the top of the lift-transient range above. It exists
+// so a very short flick (motion confined to its last 30 ms, so nothing reached the pointer)
+// is not turned into a click.
+#ifndef TPS43_SOFT_TAP_MAX_TRAVEL
+#    define TPS43_SOFT_TAP_MAX_TRAVEL 96
+#endif
+
+// Diagnostics: define TPS43_TAP_DEBUG (and CONSOLE_ENABLE = yes in rules.mk) to print one
+// line per single-finger touch on the QMK console. Only the half that owns the pad prints,
+// and a slave's console never reaches the host, so plug THAT half into USB to read it.
+// For a tap that did nothing, the line says why: dur over the tap time, travel over the
+// limit, moved (the pointer did move), or chip=0 soft=0 with read failures.
 
 // Accumulate raw deltas and emit delta/divisor, carrying the remainder so slow movement
 // is preserved instead of truncated to zero. This accumulate-and-divide is itself a
@@ -584,6 +739,29 @@ static inline int16_t tps43_scale(int16_t delta, int16_t *accum, uint8_t divisor
     *accum -= out * divisor;
     return out;
 }
+
+#if TPS43_ACCEL_ENABLE
+// gain(v) of the acceleration curve, in 1/256. v_q4 is speed in counts/cycle * 16.
+static int32_t tps43_accel_gain(int32_t v_q4) {
+    const int32_t lo = TPS43_ACCEL_SPEED_LO * 16;
+    const int32_t hi = TPS43_ACCEL_SPEED_HI * 16;
+    if (v_q4 <= lo) return TPS43_ACCEL_GAIN_MIN;
+    if (v_q4 >= hi) return TPS43_ACCEL_GAIN_MAX;
+    const int32_t t = (v_q4 - lo) * 256 / (hi - lo);         // 0..256
+    const int32_t s = t * t * (3 * 256 - 2 * t) / (256 * 256); // smoothstep, 0..256
+    return TPS43_ACCEL_GAIN_MIN + (TPS43_ACCEL_GAIN_MAX - TPS43_ACCEL_GAIN_MIN) * s / 256;
+}
+
+// tps43_scale with a variable gain: same accumulate-and-carry, so sub-pixel motion is kept
+// and an alternating tremble still sums back to nothing. int32 because delta * gain can
+// exceed int16 on a fast swipe.
+static inline int16_t tps43_scale_gain(int16_t delta, int32_t *accum, int32_t gain) {
+    *accum += (int32_t)delta * gain;
+    int32_t out = *accum / 256;
+    *accum -= out * 256;
+    return (int16_t)out;
+}
+#endif
 
 // Constant-rate scroll emitter (see comment block above the tunables). Accumulates raw
 // scroll delta, clamps the backlog, and lets through at most ±1 notch per INTERVAL_MS.
@@ -627,6 +805,15 @@ static inline int16_t tps43_scroll_rate(int16_t delta, int16_t *accum, uint32_t 
 // Returns false if the cycle carried no usable data; on such a cycle the report and the finger
 // count are both zeroed, which the click stretch treats as "keep stretching" -- the safe way
 // round for a NAK.
+// Per-cycle chip state tps43_read_raw does not put in the report: the scroll bit (the
+// else-if below drops it on a tap cycle, and a slow scroll has zero h/v on sub-unit cycles)
+// and the cycle timing, for the diagnostics.
+static struct {
+    bool    scroll;
+    bool    rr_missed;
+    uint8_t cycle_ms;
+} tps43_cycle;
+
 static bool tps43_read_raw(report_mouse_t *out, uint8_t *fingers_out) {
     report_mouse_t            r    = {0};
     azoteq_iqs5xx_base_data_t base = {0};
@@ -636,7 +823,10 @@ static bool tps43_read_raw(report_mouse_t *out, uint8_t *fingers_out) {
     if (azoteq_iqs5xx_get_base_data(&base) != I2C_STATUS_SUCCESS) {
         return false; // NAK or bad read: no information this cycle, state must not advance
     }
-    *fingers_out = base.number_of_fingers;
+    *fingers_out          = base.number_of_fingers;
+    tps43_cycle.scroll    = base.gesture_events_1.scroll;
+    tps43_cycle.rr_missed = base.system_info_1.rr_missed;
+    tps43_cycle.cycle_ms  = base.previous_cycle_time;
 
     int16_t raw_x = AZOTEQ_IQS5XX_COMBINE_H_L_BYTES(base.x.h, base.x.l);
     int16_t raw_y = AZOTEQ_IQS5XX_COMBINE_H_L_BYTES(base.y.h, base.y.l);
@@ -646,7 +836,7 @@ static bool tps43_read_raw(report_mouse_t *out, uint8_t *fingers_out) {
     } else if (base.gesture_events_1.two_finger_tap) {
         r.buttons = pointing_device_handle_buttons(r.buttons, true, POINTING_DEVICE_BUTTON2);
     } else if (base.gesture_events_1.scroll) {
-        r.h = CONSTRAIN_HID(raw_x);
+        r.h = CONSTRAIN_HID(TPS43_SCROLL_H_SIGN * raw_x);
         r.v = CONSTRAIN_HID(raw_y);
     }
     if (base.number_of_fingers == 1) {
@@ -772,8 +962,96 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
     }
 #endif
 
+    // Soft tap (see the tunable's comment block). Must run AFTER the lift-off hold, because
+    // "did this touch move the pointer" means "did anything leave the hold", and BEFORE the
+    // tap state machine below, so a soft tap is treated exactly like a chip tap (it can end
+    // a double click, or be a single click). r.x/r.y are still the raw deltas here.
+#if TPS43_SOFT_TAP_ENABLE
+    {
+        static bool     touching = false;
+        static bool     spoiled  = false; // this touch can no longer be a soft tap
+        static uint32_t down_ms  = 0;
+        static uint8_t  cycles   = 0; // good reads with a finger down, saturating
+        static int16_t  travel_x = 0, travel_y = 0;
+#    ifdef TPS43_TAP_DEBUG
+        static uint8_t fails = 0, missed = 0, max_cycle = 0;
+        static bool    moved = false, multi = false, scrolled = false;
+        if (!read_ok && touching && fails < 255) fails++;
+#    endif
+        if (read_ok && fingers >= 1) {
+            if (!touching) {
+                touching = true;
+                spoiled  = false;
+                down_ms  = timer_read32();
+                cycles   = 0;
+                travel_x = 0;
+                travel_y = 0;
+#    ifdef TPS43_TAP_DEBUG
+                fails = missed = max_cycle = 0;
+                moved = multi = scrolled = false;
+#    endif
+            }
+            if (cycles < 255) cycles++;
+            if (!spoiled) {
+                travel_x += r.x;
+                travel_y += r.y;
+                if (fingers >= 2 || tps43_cycle.scroll || x != 0 || y != 0 || travel_x > TPS43_SOFT_TAP_MAX_TRAVEL || travel_x < -TPS43_SOFT_TAP_MAX_TRAVEL || travel_y > TPS43_SOFT_TAP_MAX_TRAVEL || travel_y < -TPS43_SOFT_TAP_MAX_TRAVEL) {
+                    spoiled = true; // and travel stops accumulating, so it cannot overflow
+                }
+            }
+#    ifdef TPS43_TAP_DEBUG
+            moved |= (x != 0 || y != 0);
+            multi |= (fingers >= 2);
+            scrolled |= tps43_cycle.scroll;
+            if (tps43_cycle.rr_missed && missed < 255) missed++;
+            if (tps43_cycle.cycle_ms > max_cycle) max_cycle = tps43_cycle.cycle_ms;
+#    endif
+        } else if (read_ok && touching) {
+            // Lift: the datasheet puts the chip's single_tap in THIS cycle, so r.buttons
+            // already holds it if the chip saw a tap -- in which case nothing is added.
+            touching             = false;
+            const uint32_t dur   = timer_elapsed32(down_ms);
+            const bool     chip  = r.buttons != 0;
+            // cycles >= 2: a one-cycle contact is a lift bounce (the finger re-grazing the pad
+            // right after a tap), and would otherwise turn one tap into two clicks.
+            const bool     soft  = !chip && !spoiled && cycles >= 2 && dur <= TPS43_SOFT_TAP_MAX_MS;
+            if (soft) {
+                r.buttons = 1 << POINTING_DEVICE_BUTTON1;
+            }
+#    ifdef TPS43_TAP_DEBUG
+            if (!multi && !scrolled) {
+                uprintf("tap: dur=%lu cyc=%u chip=%u soft=%u travel=%d,%d moved=%u fails=%u rr_missed=%u max_cycle=%u\n", (unsigned long)dur, cycles, chip, soft, travel_x, travel_y, moved, fails, missed, max_cycle);
+            }
+#    endif
+        }
+    }
+#endif
+
+#if TPS43_ACCEL_ENABLE
+    // Speed estimate for the acceleration curve, from the same deltas that are about to be
+    // scaled (so it sees exactly what the pointer will do, after the gate and the hold).
+    // Magnitude is max + min/2, a cheap stand-in for the Euclidean length (within ~12%).
+    {
+        static int32_t acc_gx = 0, acc_gy = 0;
+        static int32_t speed_q4 = 0;
+        if (read_ok && fingers == 0) {
+            speed_q4 = 0; // new stroke starts slow
+        } else if (read_ok) {
+            const int32_t ax  = x < 0 ? -x : x;
+            const int32_t ay  = y < 0 ? -y : y;
+            const int32_t mag = (ax > ay) ? ax + ay / 2 : ay + ax / 2;
+            speed_q4 += (mag * 16 - speed_q4) / (1 << TPS43_ACCEL_EMA_SHIFT);
+        }
+        const int32_t gain = tps43_accel_gain(speed_q4);
+        r.x                = tps43_scale_gain(x, &acc_gx, gain);
+        r.y                = tps43_scale_gain(y, &acc_gy, gain);
+        (void)acc_x;
+        (void)acc_y;
+    }
+#else
     r.x = tps43_scale(x, &acc_x, TPS43_CURSOR_DIVISOR);
     r.y = tps43_scale(y, &acc_y, TPS43_CURSOR_DIVISOR);
+#endif
 
     // Scroll: constant-rate limiter (see tps43_scroll_rate). We must NOT reset the
     // backlog on a single 0-delta cycle (the chip keeps SCROLL=1 through sub-unit cycles
@@ -788,6 +1066,89 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
     }
     r.h = tps43_scroll_rate(r.h, &acc_h, &scroll_notch_h);
     r.v = tps43_scroll_rate(r.v, &acc_v, &scroll_notch_v);
+
+    // Tap / double click / drag state machine, input side (see the tunable's comment
+    // block). BUTTON1 is taken out of the report here -- chip tap or soft tap alike, it is
+    // only an input to this machine -- so the click stretch below handles BUTTON2 only, and
+    // the machine's own BUTTON1 is added back after it.
+#if TPS43_TAP_DRAG_WINDOW_MS > 0
+    enum { TD_IDLE, TD_TAP_HELD, TD_SECOND, TD_DBL_GAP, TD_DBL_PRESS };
+    const uint8_t   td_btn          = 1 << POINTING_DEVICE_BUTTON1;
+    static uint8_t  td_state        = TD_IDLE;
+    static uint32_t td_ms           = 0;     // TAP_HELD: when the tap came; DBL_*: phase start
+    static bool     td_bounce       = false; // the second touch came down within BOUNCE_MS
+    static bool     td_pending      = false; // a tap that arrived mid double-click sequence
+    static bool     td_was_touching = false;
+    static uint8_t  td_fail_run     = 0;
+    static uint8_t  td_released_run = 255; // consecutive previous reports with BUTTON1 up
+    const bool      td_tap          = (r.buttons & td_btn) != 0;
+    r.buttons &= ~td_btn;
+
+    // Touch edges only from good reads: a NAK reads as 0 fingers, and taking that as a lift
+    // would end a drag mid-stroke. A long run of NAKs does end it, though (see NAK_RELEASE).
+    bool td_down = false, td_lift = false;
+    if (read_ok) {
+        td_fail_run         = 0;
+        const bool touching = fingers >= 1;
+        td_down             = touching && !td_was_touching;
+        td_lift             = !touching && td_was_touching;
+        td_was_touching     = touching;
+    } else if (td_fail_run < 255 && ++td_fail_run >= TPS43_TAP_DRAG_NAK_RELEASE && td_state == TD_SECOND) {
+        td_state        = TD_IDLE;
+        td_was_touching = false;
+    }
+
+    switch (td_state) {
+        case TD_IDLE:
+            if (td_tap || td_pending) {
+                td_pending = false;
+                td_state   = TD_TAP_HELD; // press now, release deferred
+                td_ms      = timer_read32();
+            }
+            break;
+        case TD_TAP_HELD:
+            if (td_down && timer_elapsed32(td_ms) <= TPS43_TAP_DRAG_WINDOW_MS) {
+                if (fingers >= 2) {
+                    td_state = TD_IDLE; // a two-finger touch is a scroll: end the click now
+                } else {
+                    td_bounce = timer_elapsed32(td_ms) < TPS43_TAP_DRAG_BOUNCE_MS;
+                    td_state  = TD_SECOND; // undecided: drag or double click; button stays down
+                }
+            } else if (timer_elapsed32(td_ms) > TPS43_TAP_DRAG_WINDOW_MS) {
+                td_state = TD_IDLE; // no second touch: a single click, released here
+            }
+            break;
+        case TD_SECOND:
+            // Nothing to decide mid-touch: if it moves, the held button already makes it a
+            // drag. Only the lift decides. The chip's single_tap arrives in the lift cycle
+            // (datasheet 6.1), and the soft tap above fires in it too.
+            if (td_lift) {
+                if (td_tap && !td_bounce) {
+                    td_state = TD_DBL_GAP; // it was a tap: release, then click once more
+                    td_ms    = timer_read32();
+                } else {
+                    td_state = TD_IDLE; // it was a drag (or a bounce): release ends it
+                }
+            }
+            break;
+        case TD_DBL_GAP:
+            if (td_tap) td_pending = true;
+            if (td_released_run >= 2 && timer_elapsed32(td_ms) >= TPS43_TAP_DRAG_GAP_MS) {
+                td_state = TD_DBL_PRESS;
+                td_ms    = timer_read32();
+            }
+            break;
+        case TD_DBL_PRESS:
+            if (td_tap) td_pending = true;
+            if (timer_elapsed32(td_ms) >= TPS43_TAP_DRAG_CLICK_MS) {
+                td_state = TD_IDLE; // a third tap (td_pending) is picked up from here
+            }
+            break;
+    }
+    if (td_state == TD_SECOND) {
+        r.buttons = 0; // a second finger tapping during a drag is not a right click
+    }
+#endif
 
     // Buttons: stretch the chip's one-cycle tap event to at least TPS43_CLICK_MIN_MS (see
     // the comment block above the tunable). While the raw report still asserts a button we
@@ -827,13 +1188,35 @@ static report_mouse_t tps43_get_report(report_mouse_t mouse_report) {
         // clear, so it is not a live bug; but the full 50 ms is not actually guaranteed, and
         // if a dropped click ever comes back this line is the first suspect.
         // On a failed read fingers is 0, so the stretch simply continues -- the safe way round.
-        if (fingers >= 1) {
+        //
+        // (With TPS43_TAP_DRAG_WINDOW_MS on, BUTTON1 never reaches this stretch -- the tap
+        // state machine owns it -- so all of this is about the two-finger tap's BUTTON2.)
+        //
+        // UPDATE: the cut now waits TPS43_CLICK_CUT_MIN_MS, i.e. at least two reports. A cut
+        // at the first contact gave a click exactly one report long whenever the finger came
+        // back within one cycle -- a fast double tap, or a lift bounce -- and one report is
+        // what the split samplers can miss, so that click vanished. Holding it 20 ms into
+        // the new touch cannot start a drag: that touch emits no motion for longer than
+        // this (touch-down gate plus the 30 ms lift-off hold).
+        if (fingers >= 1 && timer_elapsed32(held_since) >= TPS43_CLICK_CUT_MIN_MS) {
             held_buttons = 0;
         } else if (timer_elapsed32(held_since) >= TPS43_CLICK_MIN_MS) {
             held_buttons = 0;
         }
     }
     r.buttons = held_buttons;
+#endif
+
+    // Tap / double click / drag state machine, output side.
+#if TPS43_TAP_DRAG_WINDOW_MS > 0
+    if (td_state == TD_TAP_HELD || td_state == TD_SECOND || td_state == TD_DBL_PRESS) {
+        r.buttons |= td_btn;
+    }
+    if (r.buttons & td_btn) {
+        td_released_run = 0;
+    } else if (td_released_run < 255) {
+        td_released_run++;
+    }
 #endif
     // (Zoom is disabled in config.h, so BUTTON7/8 never appear here.)
     return r;
