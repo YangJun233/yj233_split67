@@ -378,3 +378,16 @@ void suspend_wakeup_init_kb(void) {
 
     suspend_wakeup_init_user();
 }
+
+#ifdef TPS43_CAL_DEBUG
+// Diagnostics (see pointing.c, TPS43_CAL_DEBUG): a right click can also come from a KEY --
+// keymap.c maps KC_MS_BTN2 on a thumb key -- or from a Vial combo / tap dance resolving to one.
+// Log every mouse-button keycode so a click in the console log can be traced to the pad
+// ("tps43 ... two_finger_tap") or to a key ("key ... mouse button").
+bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
+    if (keycode >= KC_MS_BTN1 && keycode <= KC_MS_BTN8) {
+        uprintf("key %lu mouse button %u %s (row %u col %u)\n", (unsigned long)timer_read32(), (unsigned)(keycode - KC_MS_BTN1 + 1), record->event.pressed ? "down" : "up", record->event.key.row, record->event.key.col);
+    }
+    return process_record_user(keycode, record);
+}
+#endif

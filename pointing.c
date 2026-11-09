@@ -56,6 +56,11 @@ void yj_expansion_kill_indicate(void);
 #define TPS43_FILTER_IIR_SELECT 0x04 // set = static IIR; clear (our choice) = dynamic IIR
 #define TPS43_FILTER_ALP 0x08
 #define TPS43_I2C_TIMEOUT_MS 10
+// Init-time register writes only. The first write after azoteq_iqs5xx_init() closed its window
+// has to wait (clock stretching) for the chip's next comms window, which can take longer than
+// one 10 ms cycle: with 10 ms the very first write was measured reporting failure on all three
+// attempts although the value had landed. Not used in the per-cycle poll path.
+#define TPS43_I2C_INIT_TIMEOUT_MS 50
 
 // Tunables (override in config.h if needed):
 #ifndef TPS43_STATIONARY_THRESHOLD
@@ -64,6 +69,71 @@ void yj_expansion_kill_indicate(void);
 #ifndef TPS43_BOTTOM_BETA
 #    define TPS43_BOTTOM_BETA 5 // ZMK default; higher = more low-speed smoothing
 #endif
+
+// ---- TPS43 reference refresh: QMK's driver switches the chip's own refresh off -----------
+// The pad decides "touched" per channel by Delta = Count - Reference against a threshold
+// derived from Reference (datasheet 3.3.4 / 3.5.2). The reference is a snapshot of the
+// untouched pad, and the chip only refreshes it from LP1 / LP2 (3.4.1: "it only executes from
+// the LP1 and LP2 states"). QMK's azoteq_iqs5xx_init() writes 255 = "never" to the Idle-mode
+// timeout (0x0586), so the chip never reaches LP1 and keeps whatever reference it took at boot
+// for the whole session. Re-ATI's drift trigger (3.7.2 condition 1) tests the reference itself,
+// so a frozen reference cannot trip it either.
+//
+// What can make that reference wrong, all on-chip and all at the module's factory settings
+// (QMK only turns REATI on):
+//   1. Boot ATI with a hand on / near the pad (e.g. pressing reset next to it).
+//   2. Stationary-touch reseed (Figure 4.1): a contact that stays within the stationary
+//      threshold (0x0672, raised to 7 by tps43_apply_smoothing) drops Active -> Idle-Touch, and
+//      after the Idle-Touch timeout (0x0585) the chip reseeds with that contact still on it.
+//   3. A Re-ATI that runs while a finger is on the pad.
+// A wrong reference leaves channels reading below it once the hand is gone. That area is then
+// partly blind: one finger's blob can split in two (two_finger_tap = right click), or the
+// finger count flickers mid-stroke and the fragments come out as (soft) taps -> stray click /
+// double click. Re-ATI condition 3 repairs it on its own only if the deficit exceeds "min count
+// Re-ATI delta" for 15 cycles -- which is the "过一会自己好了" case; a smaller deficit stays
+// until a reset re-runs ATI, which is the "复位就好" case.
+//
+// MEASURED on this pad (TPS43_CAL_DEBUG dump, 2026-11-09), factory values unless noted:
+//   ATI target 700, reference drift limit 75 (Re-ATI outside 625..775), min count Re-ATI delta
+//   30, touch multiplier set/clear 16/12 (touch at Reference * 1.125, i.e. ~+87 counts), prox
+//   threshold 23, palm threshold 25 / timeout 15 x 32 ms, max touches 4, split factor 3.
+//   Timeouts: active 5 s, idle-touch 60 s, idle 255 (QMK's write), LP1 1 x 20 s,
+//   REFERENCE UPDATE 8 s. Report rates: active / idle-touch / idle 10 ms (QMK), LP1 80, LP2 160.
+//   System Config 0 = 0x6C: MANUAL_CONTROL 0 (auto modes), WDT on, REATI + ALP_REATI on.
+// So the module IS configured to refresh its reference every 8 s -- from LP1, which QMK's 255
+// makes unreachable. A deficit under 30 counts (a third of the ~87-count touch margin) is never
+// corrected. A spontaneous Re-ATI with no finger on the pad was also caught 39 s after a reset
+// on the unfixed firmware, i.e. that boot's ATI had been off.
+//
+// ---- Fix: give the chip back its own reference refresh (LP1) ----------------------------
+// Idle-mode timeout -> TPS43_IDLE_TIMEOUT_S so the chip reaches LP1 after that long with no
+// touch; LP1 report rate -> TPS43_LP1_REPORT_RATE_MS (factory 80) so a touch landing from LP1
+// is picked up as fast as from Idle; LP1 timeout -> 255 so it never drops further to LP2
+// (160 ms, slow enough to sample straight past a 70 ms tap). The chip then refreshes its
+// reference every 8 s on its own, only from LP1, which it leaves as soon as prox (23 counts,
+// well under the ~87 touch threshold) sees a hand coming. Verified on the pad: idle -> lp1
+// ~2-3 s after lift, and every wake-up's first cycle already carries the finger
+// ("lp1 -> idle fingers 0 -> 1", active one cycle later); taps of 19-99 ms straight out of LP1
+// were all recognised by the chip, two-finger taps too. Set TPS43_IDLE_TIMEOUT_S to 255 to go
+// back to QMK's behaviour.
+#ifndef TPS43_IDLE_TIMEOUT_S
+#    define TPS43_IDLE_TIMEOUT_S 3
+#endif
+#ifndef TPS43_LP1_REPORT_RATE_MS
+#    define TPS43_LP1_REPORT_RATE_MS AZOTEQ_IQS5XX_REPORT_RATE
+#endif
+// TPS43_IDLE_TOUCH_TIMEOUT, if defined, is written to 0x0585 at init (seconds; 255 = never
+// absorb a resting contact). Not defined by default: 255 also removes the chip's recovery from
+// a genuinely stuck phantom touch, and the LP1 refresh already heals what mechanism 2 leaves.
+//
+// Diagnostics: TPS43_CAL_DEBUG prints a register dump ~5 s after boot (with what each init
+// write read back as), every charging-mode change, every Re-ATI / ATI error / palm / chip
+// self-reset flag change, and every two_finger_tap. Needs the console and the PAD half on USB
+// (a slave's console never reaches the host):
+//   qmk compile -kb yj233_split67 -km vial -e CONSOLE_ENABLE=yes -e "EXTRAFLAGS=-DTPS43_CAL_DEBUG -DTPS43_TAP_DEBUG"
+// and any HID console reader (QMK Toolbox, hid_listen).
+#define TPS43_REG_BASE_DATA 0x000C       // = the driver's AZOTEQ_IQS5XX_REG_PREVIOUS_CYCLE_TIME
+#define TPS43_REG_SYSTEM_CONTROL_0 0x0431 // ACK_RESET | - | AUTO_ATI | ALP_RESEED | RESEED | MODE_SELECT[2:0]
 
 typedef enum { MODULE_NONE = 0, MODULE_TPS43, MODULE_TRACKPOINT } pointing_module_t;
 static pointing_module_t active_module = MODULE_NONE;
@@ -90,23 +160,52 @@ static void trackpoint_reset(void) {
 // QMK versions) rather than the i2c_write_register16 helper, whose name differs between
 // versions. Retries across a couple of comms windows in case the first attempt lands
 // between the sensor's cycles and NAKs.
-static void tps43_write_reg8(uint16_t reg, uint8_t val) {
+static bool tps43_write_reg8(uint16_t reg, uint8_t val) {
     uint8_t packet[3] = {(uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF), val};
     for (uint8_t i = 0; i < 3; i++) {
-        if (i2c_transmit(AZOTEQ_IQS5XX_ADDRESS, packet, sizeof(packet), TPS43_I2C_TIMEOUT_MS) == I2C_STATUS_SUCCESS) {
-            return;
+        if (i2c_transmit(AZOTEQ_IQS5XX_ADDRESS, packet, sizeof(packet), TPS43_I2C_INIT_TIMEOUT_MS) == I2C_STATUS_SUCCESS) {
+            return true;
         }
         wait_ms(2);
     }
+    return false;
 }
+
+#ifdef TPS43_CAL_DEBUG
+// Init-time evidence for the debug dump: which writes failed (bit i = i-th write below), and
+// what the registers read back as inside the same window, before anything else could touch them.
+static uint8_t tps43_init_fail = 0;
+static uint8_t tps43_init_readback[6]; // 0x0580, 0x0581, 0x0586, 0x0587, 0x0632, 0x0672
+#    define TPS43_INIT_WRITE(n, reg, val) \
+        if (!tps43_write_reg8(reg, val)) tps43_init_fail |= (1 << (n))
+#else
+#    define TPS43_INIT_WRITE(n, reg, val) tps43_write_reg8(reg, val)
+#endif
 
 // Turn on the sensor's built-in smoothing. All writes share ONE comms window; the final
 // END_COMMS write closes it so the chip resumes normal operation (same handshake QMK's
 // driver and ZMK's use). Run once, right after azoteq_iqs5xx_init().
 static void tps43_apply_smoothing(void) {
-    tps43_write_reg8(TPS43_REG_FILTER_SETTINGS, TPS43_FILTER_IIR | TPS43_FILTER_MAV | TPS43_FILTER_ALP); // dynamic IIR (IIR_SELECT left clear)
-    tps43_write_reg8(TPS43_REG_STATIONARY_THRESH, TPS43_STATIONARY_THRESHOLD);
-    tps43_write_reg8(TPS43_REG_BOTTOM_BETA, TPS43_BOTTOM_BETA);
+    TPS43_INIT_WRITE(0, TPS43_REG_FILTER_SETTINGS, TPS43_FILTER_IIR | TPS43_FILTER_MAV | TPS43_FILTER_ALP); // dynamic IIR (IIR_SELECT left clear)
+    TPS43_INIT_WRITE(1, TPS43_REG_STATIONARY_THRESH, TPS43_STATIONARY_THRESHOLD);
+    TPS43_INIT_WRITE(2, TPS43_REG_BOTTOM_BETA, TPS43_BOTTOM_BETA);
+#ifdef TPS43_IDLE_TOUCH_TIMEOUT
+    tps43_write_reg8(0x0585, TPS43_IDLE_TOUCH_TIMEOUT); // Idle-Touch timeout [s], see the block above
+#endif
+    // LP1 reference refresh (see "Fix: give the chip back its own reference refresh").
+    // Overrides the 255 azoteq_iqs5xx_init() wrote to 0x0586 just before this.
+    TPS43_INIT_WRITE(3, 0x0580, (uint8_t)(TPS43_LP1_REPORT_RATE_MS >> 8)); // LP1 report rate, high byte
+    TPS43_INIT_WRITE(4, 0x0581, (uint8_t)(TPS43_LP1_REPORT_RATE_MS & 0xFF)); // low byte
+    TPS43_INIT_WRITE(5, 0x0587, 255);                                      // LP1 timeout: never go on to LP2
+    TPS43_INIT_WRITE(6, 0x0586, TPS43_IDLE_TIMEOUT_S);                     // Idle -> LP1 after this many s
+#ifdef TPS43_CAL_DEBUG
+    {
+        static const uint16_t rb[6] = {0x0580, 0x0581, 0x0586, 0x0587, 0x0632, 0x0672};
+        for (uint8_t i = 0; i < 6; i++) {
+            if (i2c_read_register16(AZOTEQ_IQS5XX_ADDRESS, rb[i], &tps43_init_readback[i], 1, TPS43_I2C_TIMEOUT_MS) != I2C_STATUS_SUCCESS) tps43_init_readback[i] = 0xEE;
+        }
+    }
+#endif
     uint8_t end_pkt[3] = {(uint8_t)(TPS43_REG_END_COMMS >> 8), (uint8_t)(TPS43_REG_END_COMMS & 0xFF), 0x00};
     i2c_transmit(AZOTEQ_IQS5XX_ADDRESS, end_pkt, sizeof(end_pkt), TPS43_I2C_TIMEOUT_MS);
 }
@@ -814,15 +913,109 @@ static struct {
     uint8_t cycle_ms;
 } tps43_cycle;
 
+static void tps43_end_comms(void) {
+    uint8_t end_pkt[3] = {(uint8_t)(TPS43_REG_END_COMMS >> 8), (uint8_t)(TPS43_REG_END_COMMS & 0xFF), 0x00};
+    i2c_transmit(AZOTEQ_IQS5XX_ADDRESS, end_pkt, sizeof(end_pkt), TPS43_I2C_TIMEOUT_MS);
+}
+
+#ifdef TPS43_CAL_DEBUG
+// Calibration diagnostics (see the TPS43_CAL_DEBUG block at the top). Runs inside the open
+// comms window right after the base-data read, so the extra reads cost no clock stretching.
+static void tps43_dump_regs(void) {
+    static const struct {
+        uint16_t    reg;
+        uint8_t     len;
+        const char *name;
+    } regs[] = {
+        {0x056D, 2, "ati_target"},
+        {0x0571, 1, "ref_drift_limit"},
+        {0x0573, 5, "reati_comp_lo,hi,max_count(2),retry_s"},
+        {0x057A, 10, "rr_ms active,idle_touch,idle,lp1,lp2"},
+        {0x0584, 7, "timeout active,idle_touch,idle,lp1x20,ref_update,snap,i2c"},
+        {0x058E, 2, "sys_cfg0,1"},
+        {0x0594, 4, "prox_tp,prox_alp,touch_mult_set,clear"},
+        {0x062E, 1, "min_count_reati_delta"},
+        {0x0669, 5, "xy_cfg0,max_touch,split,palm_thr,palm_timeout"},
+        {0x0632, 1, "filter_settings"},
+        {0x0637, 1, "xy_bottom_beta"},
+        {0x0672, 1, "stationary_thr"},
+        {0x067A, 1, "touch_snap_db"},
+    };
+    uprintf("tps43 regs @%lu (build: lp1 idle=%u lp1_rr=%u):\n", (unsigned long)timer_read32(), TPS43_IDLE_TIMEOUT_S, TPS43_LP1_REPORT_RATE_MS);
+    uprintf("  init write fail mask=0x%02X, readback 0580,0581,0586,0587,0632,0672 = %u %u %u %u %u %u\n", tps43_init_fail, tps43_init_readback[0], tps43_init_readback[1], tps43_init_readback[2], tps43_init_readback[3], tps43_init_readback[4], tps43_init_readback[5]);
+    for (uint8_t i = 0; i < ARRAY_SIZE(regs); i++) {
+        uint8_t buf[10] = {0};
+        if (i2c_read_register16(AZOTEQ_IQS5XX_ADDRESS, regs[i].reg, buf, regs[i].len, TPS43_I2C_TIMEOUT_MS) != I2C_STATUS_SUCCESS) {
+            uprintf("  %04X %s: read failed\n", regs[i].reg, regs[i].name);
+            continue;
+        }
+        uprintf("  %04X %s:", regs[i].reg, regs[i].name);
+        for (uint8_t j = 0; j < regs[i].len; j++) uprintf(" %u", buf[j]);
+        uprintf("\n");
+    }
+    // ACK_RESET, so SHOW_RESET only comes back if the chip resets on its own from now on.
+    uint8_t pkt[3] = {(uint8_t)(TPS43_REG_SYSTEM_CONTROL_0 >> 8), (uint8_t)(TPS43_REG_SYSTEM_CONTROL_0 & 0xFF), 0x80};
+    i2c_transmit(AZOTEQ_IQS5XX_ADDRESS, pkt, sizeof(pkt), TPS43_I2C_TIMEOUT_MS);
+}
+
+static void tps43_cal_debug(const azoteq_iqs5xx_base_data_t *base) {
+    static const char *const mode_name[] = {"active", "idle_touch", "idle", "lp1", "lp2", "?5", "?6", "?7"};
+    static bool              dumped      = false;
+    static uint8_t           prev_mode = 0xFF, prev_fingers = 0;
+    static uint8_t           prev_flags = 0;
+    const uint8_t           *raw        = (const uint8_t *)base; // [1]=gest0 [2]=gest1 [3]=sys0 [4]=sys1
+    const uint8_t            mode       = raw[3] & 0x07;
+    // sys0 bits 3..7 (ati_error, reati_occurred, alp_ati_error, alp_reati_occurred, show_reset)
+    // and sys1 bits 1..2 (palm_detect, too_many_fingers). tp_movement / rr_missed are left out:
+    // they change every few cycles and would bury everything else.
+    const uint8_t flags = (raw[3] & 0xF8) | ((raw[4] & 0x06) >> 1);
+    const uint32_t now  = timer_read32();
+
+    // Console is not attached yet at boot, so dump a few seconds in; again after a chip self-reset.
+    if ((!dumped && now > 5000) || (dumped && base->system_info_0.show_reset)) {
+        dumped = true;
+        tps43_dump_regs();
+    }
+    if (mode != prev_mode) {
+        // idle_touch -> idle/active with a finger before and none now is the stationary-touch
+        // reseed (datasheet Figure 4.1): whatever was resting on the pad is now in the reference.
+        uprintf("tps43 %lu mode %s -> %s fingers %u -> %u\n", (unsigned long)now, prev_mode < 8 ? mode_name[prev_mode] : "-", mode_name[mode], prev_fingers, base->number_of_fingers);
+        prev_mode = mode;
+    }
+    if (flags != prev_flags) {
+        uprintf("tps43 %lu flags ati_err=%u reati=%u alp_ati_err=%u alp_reati=%u show_reset=%u palm=%u too_many=%u fingers=%u\n", (unsigned long)now, (flags >> 3) & 1, (flags >> 4) & 1, (flags >> 5) & 1, (flags >> 6) & 1, (flags >> 7) & 1, flags & 1, (flags >> 1) & 1, base->number_of_fingers);
+        prev_flags = flags;
+    }
+    // When the right click came, how long since this half last SAW one / two fingers. A tap
+    // made straight out of LP1 can arrive with no contact seen at all ("lp1 -> active fingers
+    // 0 -> 0"), so a large value here is NOT by itself proof of a phantom (measured: three real
+    // two-finger taps from LP1 all looked like that).
+    static uint32_t seen1_ms = 0, seen2_ms = 0;
+    if (base->number_of_fingers >= 1) seen1_ms = now;
+    if (base->number_of_fingers >= 2) seen2_ms = now;
+    if (base->gesture_events_1.two_finger_tap) {
+        uprintf("tps43 %lu two_finger_tap (right click) fingers=%u since_1f=%lu since_2f=%lu\n", (unsigned long)now, base->number_of_fingers, (unsigned long)(now - seen1_ms), (unsigned long)(now - seen2_ms));
+    }
+    prev_fingers = base->number_of_fingers;
+}
+#endif
+
 static bool tps43_read_raw(report_mouse_t *out, uint8_t *fingers_out) {
     report_mouse_t            r    = {0};
     azoteq_iqs5xx_base_data_t base = {0};
 
     *fingers_out = 0;
     *out         = r;
-    if (azoteq_iqs5xx_get_base_data(&base) != I2C_STATUS_SUCCESS) {
+    // Same read as azoteq_iqs5xx_get_base_data(), but the window is closed here rather than
+    // inside it, so the TPS43_CAL_DEBUG reads can share it. Like the driver, a failed read does
+    // not send END_COMMS (the chip's own I2C timeout closes the window).
+    if (i2c_read_register16(AZOTEQ_IQS5XX_ADDRESS, TPS43_REG_BASE_DATA, (uint8_t *)&base, sizeof(base), TPS43_I2C_TIMEOUT_MS) != I2C_STATUS_SUCCESS) {
         return false; // NAK or bad read: no information this cycle, state must not advance
     }
+#ifdef TPS43_CAL_DEBUG
+    tps43_cal_debug(&base);
+#endif
+    tps43_end_comms();
     *fingers_out          = base.number_of_fingers;
     tps43_cycle.scroll    = base.gesture_events_1.scroll;
     tps43_cycle.rr_missed = base.system_info_1.rr_missed;
