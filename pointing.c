@@ -116,11 +116,20 @@ void yj_expansion_kill_indicate(void);
 // ("lp1 -> idle fingers 0 -> 1", active one cycle later); taps of 19-99 ms straight out of LP1
 // were all recognised by the chip, two-finger taps too. Set TPS43_IDLE_TIMEOUT_S to 255 to go
 // back to QMK's behaviour.
+//
+// UPDATE: with LP1 at 10 ms the chip emitted PHANTOM two-finger taps (a right click with
+// nothing on the pad) from inside LP1: six logged, each "lp1 -> active fingers 0 -> 0" +
+// two_finger_tap, each within 0.34 s of a multiple of the 8 s reference-update time, all 20+ s
+// into LP1 (3rd update or later), none with a 2-finger contact read anywhere near it. So it rides
+// on the chip's LP1 reference update. Whether the non-factory 10 ms LP1 rate is what triggers
+// it is the open question; LP1 is now back at the factory 80 ms while that is being tested on
+// the hardware. 80 ms means a touch landing from LP1 waits up to one 80 ms cycle to be seen, so
+// a very quick tap straight out of LP1 may be missed -- watch for that too.
 #ifndef TPS43_IDLE_TIMEOUT_S
 #    define TPS43_IDLE_TIMEOUT_S 3
 #endif
 #ifndef TPS43_LP1_REPORT_RATE_MS
-#    define TPS43_LP1_REPORT_RATE_MS AZOTEQ_IQS5XX_REPORT_RATE
+#    define TPS43_LP1_REPORT_RATE_MS 80 // factory value (was AZOTEQ_IQS5XX_REPORT_RATE = 10, see UPDATE)
 #endif
 // TPS43_IDLE_TOUCH_TIMEOUT, if defined, is written to 0x0585 at init (seconds; 255 = never
 // absorb a resting contact). Not defined by default: 255 also removes the chip's recovery from
